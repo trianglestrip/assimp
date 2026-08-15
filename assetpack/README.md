@@ -53,3 +53,26 @@ build\Release\pack_demo.exe F:\project\meshToBrowser\models\San_Miguel\san-migue
 San Miguel（1.14GB OBJ）实测：5.93M 顶点 / 9.98M 三角形 / 2203 meshes /
 287 材质 / 323 贴图引用，几何解析约 0.6s（assimp 版为 14s+）。
 每次运行把各阶段耗时追加到 benchmark.md。
+
+## 查看器（assetpack_viewer）
+
+编译后直接运行（无参数默认加载 San Miguel）：窗口立即打开并显示
+加载进度条，模型按解析进度渐进出现 —— 顶点事件先到（默认灰色），
+材质事件替换 diffuse 颜色，全部完成后显示解析耗时。
+
+```bat
+build\Release\assetpack_viewer.exe                # 默认模型
+build\Release\assetpack_viewer.exe model.obj      # 指定模型
+build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
+```
+
+- 16 线程软件光栅化（olive.c 渲染 API + 自写透视 z-buffer：线程局部
+  缓冲 + 主线程深度合成），模型顶点池每帧并行变换一次。
+- 三角形预算默认 50 万/帧（`--tris N` 调整；San Miguel 三角形极小，
+  预算不足时按 stride 均匀采样），窗口内 Up/Down 实时增减预算。
+- `--frames N` 渲染 N 帧退出（`--wait` 时从解析完成开始计）、
+  `--shot N file.bmp` 第 N 帧截图、Space 暂停旋转、Esc 退出。
+- 渲染性能与预算追加到 benchmark.md 的 `## render` 小节。
+
+依赖（可选，`ASSETPACK_WITH_VIEWER` 默认 ON）：olive.c 单文件渲染库、
+SDL2 开发包（路径用 `-DOLIVEC_ROOT=... -DSDL2_ROOT=...` 配置）。
