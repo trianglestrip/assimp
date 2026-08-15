@@ -12,7 +12,7 @@
 // By default every triangle is drawn (no sampling); --tris N caps the
 // per-frame triangle budget (stride-sampled), Up/Down adjust it live.
 //
-// Keys: Esc quit | Up/Down triangle budget x2 / /2
+// Keys: Esc quit | Up/Down triangle budget x2 / /2 | T textures on/off
 // Mouse: drag = orbit | wheel = zoom
 // WASD: move along the view axis / strafe
 
@@ -87,7 +87,7 @@ std::vector<ap::PackMaterial> g_materials;       // materials snapshot (string_v
 std::vector<ViewerTex> g_texs;                   // decoded diffuse textures
 std::unordered_map<std::string_view, int> g_texByPath;  // mtl path -> g_texs index
 std::vector<int> g_meshTex;                      // per-mesh texture index or -1
-bool g_noTex = false;                            // --untex: disable textures
+std::atomic<bool> g_noTex{false};                // --untex / T: disable textures
 std::atomic<uint64_t> g_texPixels{0};            // decoded pixel count
 
 // ---- scene / camera ----
@@ -235,8 +235,9 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
         const uint32_t mat = g_matColor[mi];
         const int texIdx = g_meshTex[mi];
         const ViewerTex* tex =
-            texIdx >= 0 && !m.texcoords.empty() ? &g_texs[size_t(texIdx)]
-                                                : nullptr;
+            !g_noTex.load() && texIdx >= 0 && !m.texcoords.empty()
+                ? &g_texs[size_t(texIdx)]
+                : nullptr;
         const float* tc = tex ? m.texcoords.data() : nullptr;
         const uint32_t* idx = m.indices.data();
         const uint64_t base = g_meshTriStart[mi];
@@ -399,7 +400,7 @@ static void drawFrame(double fpsNow) {
                   (unsigned long long)(nTris / uint64_t(stride)), stride,
                   fpsNow);
     obv_text(c, info, 10, 10, obv_default_font(), 2, kText);
-    obv_text(c, "drag: orbit   wheel: zoom   WASD: move", 10, 30,
+    obv_text(c, "drag: orbit   wheel: zoom   WASD: move   T: textures", 10, 30,
              obv_default_font(), 2, kText);
 }
 
@@ -458,23 +459,38 @@ static void bindTextures() {
     }
     if (g_materials.empty() || g_meshTex.empty() || g_texByPath.empty()) return;
     g_meshTex.assign(g_meshTex.size(), -1);
+    size_t nMat = 0, nNoDiff = 0, nLookupFail = 0, nNoUV = 0;
+    uint64_t trisNoDiff = 0, trisBound = 0;
     for (size_t i = 0; i < g_meshes.size(); ++i) {
         const int mi = g_meshes[i].materialIndex;
         if (mi < 0 || size_t(mi) >= g_materials.size()) continue;
+        ++nMat;
         const ap::PackMaterial& m = g_materials[size_t(mi)];
+        bool hasDiff = false;
+        for (const ap::PackTexRef& ref : m.textures)
+            if (ref.type == int(ap::TexType::TexDiffuse)) { hasDiff = true; break; }
+        if (!hasDiff) { ++nNoDiff; trisNoDiff += g_meshes[i].triangleCount(); continue; }
+        bool found = false;
         for (const ap::PackTexRef& ref : m.textures) {
             if (ref.type != int(ap::TexType::TexDiffuse)) continue;
             const auto it = g_texByPath.find(ref.path);
             if (it != g_texByPath.end()) {
                 g_meshTex[i] = it->second;
+                found = true;
+                if (g_meshes[i].texcoords.empty()) ++nNoUV;
                 break;
             }
         }
+        if (!found) ++nLookupFail;
     }
     size_t bound = 0;
     for (int t : g_meshTex)
         if (t >= 0) ++bound;
-    AP_LOG("viewer", "textures bound: %zu/%zu meshes", bound, g_meshTex.size());
+    for (size_t i = 0; i < g_meshes.size(); ++i)
+        if (g_meshTex[i] >= 0) trisBound += g_meshes[i].triangleCount();
+    AP_LOG("viewer", "textures bound: %zu/%zu meshes (mat %zu, no-diff %zu, lookup-fail %zu, bound-noUV %zu); tris: %llu bound / %llu no-diff",
+           bound, g_meshTex.size(), nMat, nNoDiff, nLookupFail, nNoUV,
+           (unsigned long long)trisBound, (unsigned long long)trisNoDiff);
 }
 
 static void bindEvents(ap::AssetPack& pack) {
@@ -722,6 +738,12 @@ int main(int argc, char** argv) {
                 } else if (e.type == SDL_KEYDOWN) {
                     switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE: g_quit.store(true); break;
+                    case SDLK_t: {
+                        g_noTex.store(!g_noTex.load());
+                        AP_LOG("viewer", "textures %s",
+                               g_noTex.load() ? "OFF" : "ON");
+                        break;
+                    }
                     case SDLK_UP:   // raise the budget; 0 = draw all
                         g_triBudget = g_triBudget <= 0
                                           ? 100000
