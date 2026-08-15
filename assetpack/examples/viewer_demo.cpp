@@ -156,23 +156,7 @@ struct ShadeV {                   // one projected vertex
     float u, v;                   // texture coordinates (textured meshes)
 };
 
-static uint32_t litColor(uint32_t rgb, float nx, float ny, float nz) {
-    // two-light rig: warm key from above-front, cool fill from the
-    // opposite lower side, 20% ambient; per-channel to keep the tint
-    constexpr float kAx = -0.32f, kAy = 0.60f, kAz = 0.735f;
-    constexpr float fAx = 0.45f, fAy = -0.35f, fAz = 0.82f;
-    const float dk = nx * kAx + ny * kAy + nz * kAz;
-    const float df = nx * fAx + ny * fAy + nz * fAz;
-    const float key = dk > 0.f ? dk : 0.f;
-    const float fill = df > 0.f ? df : 0.f;
-    const float fr = 0.20f + 0.65f * key + 0.22f * fill;
-    const float fg = 0.20f + 0.60f * key + 0.26f * fill;
-    const float fb = 0.20f + 0.50f * key + 0.34f * fill;
-    const uint32_t r = uint32_t(((rgb >> 16) & 255) * fr + 0.5f);
-    const uint32_t g = uint32_t(((rgb >> 8) & 255) * fg + 0.5f);
-    const uint32_t b = uint32_t((rgb & 255) * fb + 0.5f);
-    return 0xFF000000u | (r << 16) | (g << 8) | b;
-}
+// unlit: vertex color = material diffuse (or texture texel when textured)
 
 static void rasterTri(uint32_t* px, float* zb, int W, int H,
                       const ShadeV& a, const ShadeV& b, const ShadeV& c,
@@ -247,7 +231,6 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
         if (t >= mEnd) { ++mi; continue; }
         const ap::PackMesh& m = g_meshes[mi];
         const uint32_t mat = g_matColor[mi];
-        const bool hasNrm = !m.normals.empty();
         const int texIdx = g_meshTex[mi];
         const ViewerTex* tex =
             texIdx >= 0 && !m.texcoords.empty() ? &g_texs[size_t(texIdx)]
@@ -284,20 +267,9 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
             sC.y = float(kWinH) * 0.5f - f * cy * icx;
             sC.z = cz;
             sC.w = icx;
-            float shA, shB, shC;
-            if (hasNrm) {
-                sA.c = litColor(mat, A[3], A[4], A[5]);
-                sB.c = litColor(mat, B[3], B[4], B[5]);
-                sC.c = litColor(mat, C[3], C[4], C[5]);
-            } else {
-                // face normal (cross product of the edges)
-                const float nx = (by - ay) * (cz - az) - (bz - az) * (cy - ay);
-                const float ny = (bz - az) * (cx - ax) - (bx - ax) * (cz - az);
-                const float nz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-                const float inv =
-                    1.f / std::sqrt(nx * nx + ny * ny + nz * nz);
-                sA.c = sB.c = sC.c = litColor(mat, nx * inv, ny * inv, nz * inv);
-            }
+            sA.c = mat;
+            sB.c = mat;
+            sC.c = mat;
             if (tc) {
                 sA.u = tc[ia * 2];
                 sA.v = tc[ia * 2 + 1];
@@ -349,9 +321,6 @@ static void drawFrame(double fpsNow) {
     const float s = g_scale, cx = g_center[0], cy = g_center[1], cz = g_center[2];
     const float dist = g_camDist;
     const float* src = g_meshes[0].positions.data();
-    const float* nrm = g_meshes[0].normals.empty()
-                           ? nullptr
-                           : g_meshes[0].normals.data();
     std::vector<std::thread> pool;
     pool.reserve(kThreads);
     for (int t = 0; t < kThreads; ++t) {
@@ -368,18 +337,6 @@ static void drawFrame(double fpsNow) {
                 d[0] = x1;
                 d[1] = cP * py - sP * z1;
                 d[2] = sP * py + cP * z1 + dist;
-                if (nrm) {
-                    const float nx = nrm[3 * i], ny = nrm[3 * i + 1], nz = nrm[3 * i + 2];
-                    const float nx1 = cY * nx + sY * nz;
-                    const float nz1 = -sY * nx + cY * nz;
-                    d[3] = nx1;
-                    d[4] = cP * ny - sP * nz1;
-                    d[5] = sP * ny + cP * nz1;
-                } else {
-                    d[3] = 0.f;
-                    d[4] = 0.f;
-                    d[5] = 0.f;
-                }
             }
         });
     }
