@@ -8,6 +8,8 @@
 // built viewer opens a window immediately and streams the model in as the
 // parser stages complete: vertices first (meshes appear, default colors),
 // then materials (diffuse colors), then textures (mmap'd for size stats).
+// By default every triangle is drawn (no sampling); --tris N caps the
+// per-frame triangle budget (stride-sampled), Up/Down adjust it live.
 //
 // Keys: Esc quit | Space pause rotation | Up/Down triangle budget x2 / /2
 
@@ -76,8 +78,10 @@ float g_camDist = 2.2f;
 float g_rotY = 0.6f, g_pitch = 0.35f;
 std::atomic<bool> g_paused{false};
 std::atomic<bool> g_quit{false};
-int g_triBudget = 500000;                  // triangles drawn per frame (--tris)
+int g_triBudget = 0;                       // triangles/frame, 0 = draw all (--tris)
 int g_lastStride = 1;
+bool g_cullChecked = false;                // winding probe (set once, first frame)
+bool g_cullFrontZ = true;                  // true: CCW front faces have +z winding
 
 // transformed vertex pool for the current frame: 6 floats per vertex
 // (x,y,z + nx,ny,nz in view space); all meshes share one pool (OBJ indices
@@ -217,8 +221,10 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
             const float ax = A[0], ay = A[1], az = A[2];
             const float bx = B[0], by = B[1], bz = B[2];
             const float cx = C[0], cy = C[1], cz = C[2];
-            // no backface cull: the z-buffer already resolves overlap and
-            // San Miguel's winding is not uniformly CCW
+            // backface cull: keep faces whose view-space winding matches the
+            // model's front side (probed once on the first frame)
+            const float fnz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+            if (g_cullFrontZ ? fnz <= 0.f : fnz >= 0.f) continue;
             const float iax = 1.f / az, ibx = 1.f / bz, icx = 1.f / cz;
             ShadeV sA, sB, sC;
             sA.x = float(kWinW) * 0.5f + f * ax * iax;
@@ -329,6 +335,31 @@ static void drawFrame(double fpsNow) {
         });
     }
     for (auto& th : pool) th.join();
+
+    // winding probe: models may be CW or CCW; sample the first triangles
+    // in view space once and cull the back side accordingly
+    if (!g_cullChecked) {
+        int pos = 0, neg = 0;
+        uint64_t s = 0;
+        for (size_t mi = 0; mi < g_meshes.size() && s < 4096; ++mi) {
+            const ap::PackMesh& m = g_meshes[mi];
+            const uint32_t* idx = m.indices.data();
+            const uint64_t n = std::min<uint64_t>(m.triangleCount(), 4096 - s);
+            for (uint64_t t = 0; t < n; ++t) {
+                const float* A = g_tv.data() + size_t(idx[3 * t]) * 6;
+                const float* B = g_tv.data() + size_t(idx[3 * t + 1]) * 6;
+                const float* C = g_tv.data() + size_t(idx[3 * t + 2]) * 6;
+                const float fnz = (B[0] - A[0]) * (C[1] - A[1])
+                                - (B[1] - A[1]) * (C[0] - A[0]);
+                fnz > 0.f ? ++pos : ++neg;
+            }
+            s += n;
+        }
+        g_cullFrontZ = pos >= neg;
+        g_cullChecked = true;
+        AP_LOG("viewer", "winding probe: %d ccw %d cw -> front=%s", pos, neg,
+               g_cullFrontZ ? "+z" : "-z");
+    }
 
     // 2) clear per-thread buffers and raster triangle ranges (parallel)
     for (int t = 0; t < kThreads; ++t) {
@@ -528,11 +559,13 @@ static void benchRenderLine(uint64_t frames, double fps) {
     std::ofstream out("benchmark.md", std::ios::app);
     if (tail.find("## render") == std::string::npos) out << "\n" << header;
     const double ms = frames > 0 ? 1000.0 / fps : 0.0;
+    const std::string budget =
+        g_triBudget <= 0 ? "ALL" : std::to_string(g_triBudget);
     char line[256];
     std::snprintf(line, sizeof line,
-                  "| %s | %s | %llu | %.1f | %.1f | %d | %d |\n",
+                  "| %s | %s | %llu | %.1f | %.1f | %s | %d |\n",
                   timestamp().c_str(), g_modelName.c_str(),
-                  (unsigned long long)frames, fps, ms, g_triBudget,
+                  (unsigned long long)frames, fps, ms, budget.c_str(),
                   g_lastStride);
     out << line;
 }
@@ -603,8 +636,14 @@ int main(int argc, char** argv) {
                     switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE: g_quit.store(true); break;
                     case SDLK_SPACE: g_paused.store(!g_paused.load()); break;
-                    case SDLK_UP: g_triBudget = std::min(g_triBudget * 2, 4000000); break;
-                    case SDLK_DOWN: g_triBudget = std::max(g_triBudget / 2, 1000); break;
+                    case SDLK_UP:   // raise the budget; 0 = draw all
+                        g_triBudget = g_triBudget <= 0
+                                          ? 100000
+                                          : std::min(g_triBudget * 2, 4000000);
+                        break;
+                    case SDLK_DOWN:
+                        g_triBudget = std::max(g_triBudget / 2, 0);
+                        break;
                     default: break;
                     }
                 }

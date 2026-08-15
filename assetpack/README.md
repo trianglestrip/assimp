@@ -67,9 +67,11 @@ build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
 ```
 
 - 16 线程软件光栅化（olive.c 渲染 API + 自写透视 z-buffer：线程局部
-  缓冲 + 主线程深度合成），模型顶点池每帧并行变换一次。
-- 三角形预算默认 50 万/帧（`--tris N` 调整；San Miguel 三角形极小，
-  预算不足时按 stride 均匀采样），窗口内 Up/Down 实时增减预算。
+  缓冲 + 主线程深度合成），模型顶点池每帧并行变换一次；首帧自动
+  探测模型 winding 并做背面剔除。
+- 默认绘制全部三角形（San Miguel 全画约 12fps）；`--tris N` 限制每帧
+  预算（超出时按 stride 均匀采样），窗口内 Up/Down 实时增减预算
+  （Down 到底 = 全画）。
 - `--frames N` 渲染 N 帧退出（`--wait` 时从解析完成开始计）、
   `--shot N file.bmp` 第 N 帧截图、Space 暂停旋转、Esc 退出。
 - 渲染性能与预算追加到 benchmark.md 的 `## render` 小节。
