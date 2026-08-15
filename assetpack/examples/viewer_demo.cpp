@@ -104,13 +104,15 @@ int g_lastStride = 1;
 bool g_cullChecked = false;                // winding probe (set once, first frame)
 bool g_cullFrontZ = true;                  // true: CCW front faces have +z winding
 
-// transformed vertex pool for the current frame: 6 floats per vertex
-// (x,y,z + nx,ny,nz in view space); all meshes share one pool (OBJ indices
-// are pool-relative), so the whole pool is transformed once per frame
+// transformed vertex pool for the current frame: 3 floats per vertex
+// (x,y,z in view space); all meshes share one pool (OBJ indices are
+// pool-relative), so the whole pool is transformed once per frame
 std::vector<float> g_tv;
+std::vector<char> g_meshVisible;           // per-mesh frustum cull flag
 
 // ---- runtime flags ----
 int g_frames = 0;                          // 0 = until quit
+uint64_t g_frameProfile = 0;               // counts frames for the timing log
 bool g_waitAll = false;                    // count frames only after all-done
 int g_shotAt = 0;
 std::string g_shotFile;
@@ -231,6 +233,11 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
     while (t < t1) {
         const uint64_t mEnd = g_meshTriStart[mi + 1];
         if (t >= mEnd) { ++mi; continue; }
+        if (!g_meshVisible[mi]) {          // frustum-culled this frame
+            t = mEnd;
+            ++mi;
+            continue;
+        }
         const ap::PackMesh& m = g_meshes[mi];
         const uint32_t mat = g_matColor[mi];
         const int texIdx = g_meshTex[mi];
@@ -246,9 +253,9 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
         for (; t < stop; t += stride) {
             const size_t ii = size_t(t - base) * 3;
             const uint32_t ia = idx[ii], ib = idx[ii + 1], ic = idx[ii + 2];
-            const float* A = tv + size_t(ia) * 6;
-            const float* B = tv + size_t(ib) * 6;
-            const float* C = tv + size_t(ic) * 6;
+            const float* A = tv + size_t(ia) * 3;
+            const float* B = tv + size_t(ib) * 3;
+            const float* C = tv + size_t(ic) * 3;
             const float ax = A[0], ay = A[1], az = A[2];
             const float bx = B[0], by = B[1], bz = B[2];
             const float cx = C[0], cy = C[1], cz = C[2];
@@ -270,6 +277,38 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
             sC.y = float(kWinH) * 0.5f - f * cy * icx;
             sC.z = cz;
             sC.w = icx;
+            // sub-pixel triangles: count them, then draw as a 1px point
+            // instead of entering the full rasterizer
+            const float area = 0.5f * std::fabs(
+                (sB.x - sA.x) * (sC.y - sA.y) - (sB.y - sA.y) * (sC.x - sA.x));
+            if (area < 1.f) {
+                const float wsum = (sA.w + sB.w + sC.w) / 3.f;
+                const float pz = 1.f / wsum;
+                const int px_ = int(sA.x + sB.x + sC.x) / 3;
+                const int py_ = int(sA.y + sB.y + sC.y) / 3;
+                if (px_ >= 0 && px_ < kWinW && py_ >= 0 && py_ < kWinH) {
+                    const size_t pi = size_t(py_) * size_t(kWinW) + size_t(px_);
+                    if (pz < zb[pi]) {
+                        uint32_t col = mat;
+                        if (tc) {
+                            const float u = (tc[ia * 2] + tc[ib * 2] +
+                                             tc[ic * 2]) / 3.f;
+                            const float v = (tc[ia * 2 + 1] + tc[ib * 2 + 1] +
+                                             tc[ic * 2 + 1]) / 3.f;
+                            int tx = int(u * tex->w);
+                            int ty = int((1.f - v) * tex->h);
+                            if (tx < 0) tx = 0;
+                            else if (tx >= tex->w) tx = tex->w - 1;
+                            if (ty < 0) ty = 0;
+                            else if (ty >= tex->h) ty = tex->h - 1;
+                            col = tex->px[size_t(ty) * size_t(tex->w) + size_t(tx)];
+                        }
+                        px[pi] = col;
+                        zb[pi] = pz;
+                    }
+                }
+                continue;
+            }
             sA.c = mat;
             sB.c = mat;
             sC.c = mat;
@@ -311,12 +350,13 @@ static void drawFrame(double fpsNow) {
         return;
     }
 
-    const size_t nVerts = g_tv.size() / 6;
+    const size_t nVerts = g_tv.size() / 3;
     const uint64_t nTris = g_meshTriStart.back();
     const int stride = (g_triBudget > 0 && nTris > uint64_t(g_triBudget))
                            ? int(nTris / uint64_t(g_triBudget))
                            : 1;
     g_lastStride = stride;
+    const auto t0 = Clock::now();
 
     // 1) rotate/translate the shared vertex pool (parallel)
     const float cY = std::cos(g_rotY), sY = std::sin(g_rotY);
@@ -336,7 +376,7 @@ static void drawFrame(double fpsNow) {
                 const float pz = (src[3 * i + 2] - cz) * s;
                 const float x1 = cY * px + sY * pz;
                 const float z1 = -sY * px + cY * pz;
-                float* d = g_tv.data() + 6 * i;
+                float* d = g_tv.data() + 3 * i;
                 d[0] = x1 + g_offX;
                 d[1] = cP * py - sP * z1;
                 d[2] = sP * py + cP * z1 + dist + g_offZ;
@@ -344,6 +384,41 @@ static void drawFrame(double fpsNow) {
         });
     }
     for (auto& th : pool) th.join();
+    const auto tXform = Clock::now();
+
+    // per-mesh frustum cull via the bounding-sphere test (conservative:
+    // any point of the sphere projects within cxs +/- span of its center
+    // projection, so meshes crossing the near plane or the screen edge
+    // are never dropped)
+    {
+        constexpr float nearPlane = 0.05f;
+        const float f = float(kWinH) * 0.5f / 0.5773503f;
+        for (size_t mi = 0; mi < g_meshes.size(); ++mi) {
+            const ap::PackMesh& m = g_meshes[mi];
+            const float dx = m.boundsMax[0] - m.boundsMin[0];
+            const float dy = m.boundsMax[1] - m.boundsMin[1];
+            const float dz = m.boundsMax[2] - m.boundsMin[2];
+            const float r = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz) * s;
+            const float mx = (m.boundsMin[0] + m.boundsMax[0]) * 0.5f;
+            const float my = (m.boundsMin[1] + m.boundsMax[1]) * 0.5f;
+            const float mz = (m.boundsMin[2] + m.boundsMax[2]) * 0.5f;
+            const float px = (mx - cx) * s, py = (my - cy) * s,
+                        pz = (mz - cz) * s;
+            const float x1 = cY * px + sY * pz;
+            const float z1 = -sY * px + cY * pz;
+            const float vx = x1 + g_offX;
+            const float vy = cP * py - sP * z1;
+            const float vz = sP * py + cP * z1 + dist + g_offZ;
+            if (vz - r < nearPlane) {
+                g_meshVisible[mi] = 1;   // sphere crosses the near plane
+                continue;
+            }
+            const float cxs = f * vx / vz, cys = f * vy / vz;
+            const float span = f * r / (vz - r);
+            g_meshVisible[mi] = !(cxs + span < 0 || cxs - span > kWinW ||
+                                  cys + span < 0 || cys - span > kWinH);
+        }
+    }
 
     // winding probe: models may be CW or CCW; sample the first triangles
     // in view space once and cull the back side accordingly
@@ -355,9 +430,9 @@ static void drawFrame(double fpsNow) {
             const uint32_t* idx = m.indices.data();
             const uint64_t n = std::min<uint64_t>(m.triangleCount(), 4096 - s);
             for (uint64_t t = 0; t < n; ++t) {
-                const float* A = g_tv.data() + size_t(idx[3 * t]) * 6;
-                const float* B = g_tv.data() + size_t(idx[3 * t + 1]) * 6;
-                const float* C = g_tv.data() + size_t(idx[3 * t + 2]) * 6;
+                const float* A = g_tv.data() + size_t(idx[3 * t]) * 3;
+                const float* B = g_tv.data() + size_t(idx[3 * t + 1]) * 3;
+                const float* C = g_tv.data() + size_t(idx[3 * t + 2]) * 3;
                 const float fnz = (B[0] - A[0]) * (C[1] - A[1])
                                 - (B[1] - A[1]) * (C[0] - A[0]);
                 fnz > 0.f ? ++pos : ++neg;
@@ -381,14 +456,40 @@ static void drawFrame(double fpsNow) {
         });
     }
     for (auto& th : pool) th.join();
+    const auto tRaster = Clock::now();
 
-    // 3) merge the depth-sorted thread buffers on the main thread
-    for (size_t i = 0; i < g_px.size(); ++i) {
-        float best = g_tzb[0][i];
-        int bi = 0;
-        for (int t = 1; t < kThreads; ++t)
-            if (g_tzb[t][i] < best) { best = g_tzb[t][i]; bi = t; }
-        g_px[i] = g_tpx[bi][i];
+    // 3) merge the depth-sorted thread buffers (parallel over pixel ranges;
+    // each thread owns disjoint pixels, so no shared state)
+    {
+        std::vector<std::thread> mpool;
+        mpool.reserve(kThreads);
+        for (int t = 0; t < kThreads; ++t) {
+            const size_t b = g_px.size() * size_t(t) / kThreads;
+            const size_t e = g_px.size() * (size_t(t) + 1) / kThreads;
+            mpool.emplace_back([b, e]() {
+                for (size_t i = b; i < e; ++i) {
+                    float best = g_tzb[0][i];
+                    int bi = 0;
+                    for (int t = 1; t < kThreads; ++t)
+                        if (g_tzb[t][i] < best) { best = g_tzb[t][i]; bi = t; }
+                    g_px[i] = g_tpx[bi][i];
+                }
+            });
+        }
+        for (auto& th : mpool) th.join();
+    }
+    const auto tMerge = Clock::now();
+
+    // stage timing profile (every 60th frame)
+    ++g_frameProfile;
+    if (g_frameProfile % 60 == 0) {
+        const auto msf = [](Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        AP_LOG("viewer", "frame profile: xform %.2f ms | raster %.2f ms | "
+                         "merge %.2f ms | total %.2f ms",
+               msf(t0, tXform), msf(tXform, tRaster), msf(tRaster, tMerge),
+               msf(t0, tMerge));
     }
 
     // 4) HUD
@@ -518,7 +619,8 @@ static void bindEvents(ap::AssetPack& pack) {
             g_matColor.assign(g_meshes.size(), kColor0);
             g_meshTex.assign(g_meshes.size(), -1);
             const size_t poolVerts = r.positions.size() / 3;
-            g_tv.resize(poolVerts * 6);
+            g_tv.resize(poolVerts * 3);
+            g_meshVisible.assign(g_meshes.size(), 1);
             const uint64_t nTris = g_meshTriStart.back();
             AP_LOG("viewer", "vertices ready: %zu meshes, %zu verts, %llu tris",
                    g_meshes.size(), poolVerts, (unsigned long long)nTris);
