@@ -58,7 +58,8 @@ if(ASSETPACK_WITH_VIEWER)
     endif()
 
     add_executable(assetpack_viewer examples/viewer_demo.cpp)
-    target_include_directories(assetpack_viewer PRIVATE ${OLIVEC_ROOT} ${SDL2_ROOT}/include)
+    target_include_directories(assetpack_viewer PRIVATE
+        ${OLIVEC_ROOT} ${SDL2_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
     target_link_libraries(assetpack_viewer PRIVATE assetpack olive_bridge
         "${SDL2_ROOT}/lib/x64/SDL2.lib" "${SDL2_ROOT}/lib/x64/SDL2main.lib")
     target_compile_definitions(assetpack_viewer PRIVATE SDL_MAIN_HANDLED NOMINMAX)

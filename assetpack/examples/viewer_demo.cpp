@@ -7,11 +7,13 @@
 // With no model argument the default scene (San Miguel) is loaded, so the
 // built viewer opens a window immediately and streams the model in as the
 // parser stages complete: vertices first (meshes appear, default colors),
-// then materials (diffuse colors), then textures (mmap'd for size stats).
+// then materials (diffuse colors), then textures (decoded in parallel with
+// stb_image and applied via uv sampling).
 // By default every triangle is drawn (no sampling); --tris N caps the
 // per-frame triangle budget (stride-sampled), Up/Down adjust it live.
 //
 // Keys: Esc quit | Space pause rotation | Up/Down triangle budget x2 / /2
+// Mouse: drag = orbit | wheel = zoom
 
 #include "olive_bridge.h"
 
@@ -19,6 +21,9 @@
 #include <assetpack/Log.h>
 
 #include <SDL2/SDL.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb/stb_image.h>
 
 #include <algorithm>
 #include <atomic>
@@ -34,6 +39,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -71,6 +77,17 @@ std::atomic<bool>     g_vertsReady{false};
 std::atomic<bool>     g_allDone{false};
 double g_importMs = 0, g_totalMs = 0;
 
+// ---- materials / textures ----
+struct ViewerTex {                        // decoded diffuse texture
+    int w = 0, h = 0;
+    std::vector<uint32_t> px;             // ARGB, row 0 = image top
+};
+std::vector<ap::PackMaterial> g_materials;       // materials snapshot (string_views stay valid)
+std::vector<ViewerTex> g_texs;                   // decoded diffuse textures
+std::unordered_map<std::string_view, int> g_texByPath;  // mtl path -> g_texs index
+std::vector<int> g_meshTex;                      // per-mesh texture index or -1
+std::atomic<uint64_t> g_texPixels{0};            // decoded pixel count
+
 // ---- scene / camera ----
 float g_scale = 1.f;
 float g_center[3] = {0, 0, 0};
@@ -78,6 +95,8 @@ float g_camDist = 2.2f;
 float g_rotY = 0.6f, g_pitch = 0.35f;
 std::atomic<bool> g_paused{false};
 std::atomic<bool> g_quit{false};
+bool g_dragging = false;                   // left-button orbit in progress
+int g_mouseX = 0, g_mouseY = 0;
 int g_triBudget = 0;                       // triangles/frame, 0 = draw all (--tris)
 int g_lastStride = 1;
 bool g_cullChecked = false;                // winding probe (set once, first frame)
@@ -134,6 +153,7 @@ struct ShadeV {                   // one projected vertex
     float z;                      // view space depth (for the z-buffer)
     float w;                      // 1/z, interpolated perspective-correctly
     uint32_t c;                   // lit color (0xAARRGGBB)
+    float u, v;                   // texture coordinates (textured meshes)
 };
 
 static uint32_t shadeColor(uint32_t rgb, float s) {
@@ -152,7 +172,8 @@ static float shadeDot(float nx, float ny, float nz) {
 }
 
 static void rasterTri(uint32_t* px, float* zb, int W, int H,
-                      const ShadeV& a, const ShadeV& b, const ShadeV& c) {
+                      const ShadeV& a, const ShadeV& b, const ShadeV& c,
+                      const ViewerTex* tex) {
     int lx, hx, ly, hy;
     if (!obv_normalize_triangle(size_t(W), size_t(H), int(a.x), int(a.y),
                                 int(b.x), int(b.y), int(c.x), int(c.y),
@@ -173,14 +194,30 @@ static void rasterTri(uint32_t* px, float* zb, int W, int H,
             const float z = 1.f / w;
             const size_t i = size_t(y) * size_t(W) + size_t(x);
             if (z >= zb[i]) continue;
-            // perspective-correct color blend
+            // perspective-correct attribute blending
             const float wa = l0 * a.w, wb = l1 * b.w, wc = l2 * c.w;
-            const float r = (wa * ((a.c >> 16) & 255) + wb * ((b.c >> 16) & 255)
-                             + wc * ((c.c >> 16) & 255)) / w;
-            const float g = (wa * ((a.c >> 8) & 255) + wb * ((b.c >> 8) & 255)
-                             + wc * ((c.c >> 8) & 255)) / w;
-            const float bl = (wa * (a.c & 255) + wb * (b.c & 255)
-                              + wc * (c.c & 255)) / w;
+            float r = (wa * ((a.c >> 16) & 255) + wb * ((b.c >> 16) & 255)
+                       + wc * ((c.c >> 16) & 255)) / w;
+            float g = (wa * ((a.c >> 8) & 255) + wb * ((b.c >> 8) & 255)
+                       + wc * ((c.c >> 8) & 255)) / w;
+            float bl = (wa * (a.c & 255) + wb * (b.c & 255)
+                        + wc * (c.c & 255)) / w;
+            if (tex) {
+                // sample the diffuse texture and modulate by the light
+                const float u = (wa * a.u + wb * b.u + wc * c.u) / w;
+                const float v = (wa * a.v + wb * b.v + wc * c.v) / w;
+                int tx = int(u * tex->w);
+                int ty = int((1.f - v) * tex->h);
+                if (tx < 0) tx = 0;
+                else if (tx >= tex->w) tx = tex->w - 1;
+                if (ty < 0) ty = 0;
+                else if (ty >= tex->h) ty = tex->h - 1;
+                const uint32_t tcol =
+                    tex->px[size_t(ty) * size_t(tex->w) + size_t(tx)];
+                r *= float((tcol >> 16) & 255) / 255.f;
+                g *= float((tcol >> 8) & 255) / 255.f;
+                bl *= float(tcol & 255) / 255.f;
+            }
             px[i] = 0xFF000000u
                   | (uint32_t(r + 0.5f) << 16)
                   | (uint32_t(g + 0.5f) << 8)
@@ -208,6 +245,11 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
         const ap::PackMesh& m = g_meshes[mi];
         const uint32_t mat = g_matColor[mi];
         const bool hasNrm = !m.normals.empty();
+        const int texIdx = g_meshTex[mi];
+        const ViewerTex* tex =
+            texIdx >= 0 && !m.texcoords.empty() ? &g_texs[size_t(texIdx)]
+                                                : nullptr;
+        const float* tc = tex ? m.texcoords.data() : nullptr;
         const uint32_t* idx = m.indices.data();
         const uint64_t base = g_meshTriStart[mi];
         const uint64_t stop = t1 < mEnd ? t1 : mEnd;
@@ -257,7 +299,15 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
             sA.c = shadeColor(mat, shA);
             sB.c = shadeColor(mat, shB);
             sC.c = shadeColor(mat, shC);
-            rasterTri(px, zb, kWinW, kWinH, sA, sB, sC);
+            if (tc) {
+                sA.u = tc[ia * 2];
+                sA.v = tc[ia * 2 + 1];
+                sB.u = tc[ib * 2];
+                sB.v = tc[ib * 2 + 1];
+                sC.u = tc[ic * 2];
+                sC.v = tc[ic * 2 + 1];
+            }
+            rasterTri(px, zb, kWinW, kWinH, sA, sB, sC, tex);
         }
     }
 }
@@ -391,6 +441,8 @@ static void drawFrame(double fpsNow) {
                   (unsigned long long)(nTris / uint64_t(stride)), stride,
                   fpsNow);
     obv_text(c, info, 10, 10, obv_default_font(), 2, kText);
+    obv_text(c, "drag: orbit   wheel: zoom   Space: pause", 10, 30,
+             obv_default_font(), 2, kText);
 }
 
 // ============================================================
@@ -438,6 +490,31 @@ static void saveBmp(const std::string& path) {
 // parser events -> renderer state + benchmark lines
 // ============================================================
 
+// Bind each mesh's material diffuse texture (by mtl path) to a decoded
+// texture slot. Idempotent: called from every event that may complete
+// the materials/textures picture.
+static void bindTextures() {
+    if (g_materials.empty() || g_meshTex.empty() || g_texByPath.empty()) return;
+    g_meshTex.assign(g_meshTex.size(), -1);
+    for (size_t i = 0; i < g_meshes.size(); ++i) {
+        const int mi = g_meshes[i].materialIndex;
+        if (mi < 0 || size_t(mi) >= g_materials.size()) continue;
+        const ap::PackMaterial& m = g_materials[size_t(mi)];
+        for (const ap::PackTexRef& ref : m.textures) {
+            if (ref.type != int(ap::TexType::TexDiffuse)) continue;
+            const auto it = g_texByPath.find(ref.path);
+            if (it != g_texByPath.end()) {
+                g_meshTex[i] = it->second;
+                break;
+            }
+        }
+    }
+    size_t bound = 0;
+    for (int t : g_meshTex)
+        if (t >= 0) ++bound;
+    AP_LOG("viewer", "textures bound: %zu/%zu meshes", bound, g_meshTex.size());
+}
+
 static void bindEvents(ap::AssetPack& pack) {
     pack.setProgress([](float pct) { g_progress.store(pct); });
 
@@ -461,6 +538,7 @@ static void bindEvents(ap::AssetPack& pack) {
             for (const ap::PackMesh& m : g_meshes)
                 g_meshTriStart.push_back(g_meshTriStart.back() + m.triangleCount());
             g_matColor.assign(g_meshes.size(), kColor0);
+            g_meshTex.assign(g_meshes.size(), -1);
             const size_t poolVerts = r.positions.size() / 3;
             g_tv.resize(poolVerts * 6);
             const uint64_t nTris = g_meshTriStart.back();
@@ -472,11 +550,13 @@ static void bindEvents(ap::AssetPack& pack) {
                         + msStr(double(r.verticesMicros) / 1000.0)
                         + " ms | verts " + std::to_string(poolVerts)
                         + " tris " + std::to_string(nTris) + " |");
+            bindTextures();
             g_vertsReady.store(true);
         });
 
     pack.setOnMaterialsReady(
         [](ap::PackResult& r, std::span<const ap::PackMaterial> mats) {
+            g_materials.assign(mats.begin(), mats.end());
             for (size_t i = 0; i < g_meshes.size(); ++i) {
                 const int mi = g_meshes[i].materialIndex;
                 if (mi < 0 || size_t(mi) >= mats.size()) continue;
@@ -491,12 +571,24 @@ static void bindEvents(ap::AssetPack& pack) {
             benchAppend("| " + timestamp() + " | [async] materials-ready | "
                         + msStr(double(r.materialsMicros) / 1000.0)
                         + " ms | mats " + std::to_string(mats.size()) + " |");
+            bindTextures();
         });
 
     pack.setOnTexturesReady(
         [](ap::PackResult& r, std::span<const ap::PackTexture> texs) {
-            // parallel mmap to size the texture working set
+            // parallel mmap + decode of the diffuse textures (stb_image)
+            int ndiff = 0;
+            for (const ap::PackTexture& t : texs)
+                if (!t.embedded && !t.resolvedPath.empty() &&
+                    t.type == int(ap::TexType::TexDiffuse))
+                    ++ndiff;
+            g_texs.clear();
+            g_texs.resize(size_t(ndiff));
+            g_texByPath.clear();
+            g_texPixels = 0;
+            std::vector<int> slotByPos(texs.size(), -1);
             std::atomic<size_t> next{0};
+            std::atomic<int> slot{0};
             const unsigned n = std::max(1u, std::thread::hardware_concurrency());
             std::vector<std::thread> pool;
             pool.reserve(n);
@@ -508,21 +600,53 @@ static void bindEvents(ap::AssetPack& pack) {
                         const ap::PackTexture& t = texs[k];
                         if (t.embedded || t.resolvedPath.empty()) continue;
                         auto mf = ap::MappedFile::openShared(t.resolvedPath);
-                        if (mf) {
-                            g_texBytes += mf->size();
-                            ++g_texFiles;
+                        if (!mf) continue;
+                        g_texBytes += mf->size();
+                        ++g_texFiles;
+                        if (t.type != int(ap::TexType::TexDiffuse)) continue;
+                        int w = 0, h = 0, ch = 0;
+                        unsigned char* rgba = stbi_load_from_memory(
+                            reinterpret_cast<const unsigned char*>(
+                                mf->bytes().data()),
+                            int(mf->size()), &w, &h, &ch, 4);
+                        if (!rgba) {
+                            AP_LOG_WARN("viewer", "decode failed: %.*s",
+                                        int(t.path.size()), t.path.data());
+                            continue;
                         }
+                        ViewerTex vt;
+                        vt.w = w;
+                        vt.h = h;
+                        vt.px.resize(size_t(w) * size_t(h));
+                        for (size_t p = 0; p < vt.px.size(); ++p) {
+                            const unsigned char* s = rgba + p * 4;
+                            vt.px[p] = 0xFF000000u
+                                     | (uint32_t(s[0]) << 16)
+                                     | (uint32_t(s[1]) << 8)
+                                     | uint32_t(s[2]);
+                        }
+                        stbi_image_free(rgba);
+                        const int si = slot.fetch_add(1);
+                        slotByPos[k] = si;
+                        g_texs[size_t(si)] = std::move(vt);
+                        g_texPixels += size_t(w) * size_t(h);
                     }
                 });
             for (auto& th : pool) th.join();
-            AP_LOG("viewer", "textures ready: %zu refs, %d mmap'd (%.1f MB)",
+            for (size_t k = 0; k < texs.size(); ++k)
+                if (slotByPos[k] >= 0)
+                    g_texByPath.emplace(texs[k].path, slotByPos[k]);
+            AP_LOG("viewer",
+                   "textures ready: %zu refs, %d mmap'd (%.1f MB), %d decoded (%llu px)",
                    texs.size(), g_texFiles.load(),
-                   double(g_texBytes.load()) / 1048576.0);
+                   double(g_texBytes.load()) / 1048576.0, ndiff,
+                   (unsigned long long)g_texPixels.load());
             benchAppend("| " + timestamp() + " | [async] textures-ready | "
                         + msStr(double(r.texturesMicros) / 1000.0)
                         + " ms | files " + std::to_string(g_texFiles.load())
                         + ", " + msStr(double(g_texBytes.load()) / 1048576.0)
-                        + " MB |");
+                        + " MB, " + std::to_string(ndiff) + " decoded |");
+            bindTextures();
         });
 
     pack.setOnAllDone([](ap::PackResult& r, bool ok, std::string_view err) {
@@ -646,9 +770,29 @@ int main(int argc, char** argv) {
                         break;
                     default: break;
                     }
+                } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                    if (e.button.button == SDL_BUTTON_LEFT) {
+                        g_dragging = true;
+                        g_mouseX = e.button.x;
+                        g_mouseY = e.button.y;
+                    }
+                } else if (e.type == SDL_MOUSEBUTTONUP) {
+                    if (e.button.button == SDL_BUTTON_LEFT)
+                        g_dragging = false;
+                } else if (e.type == SDL_MOUSEMOTION) {
+                    if (g_dragging) {
+                        g_rotY -= float(e.motion.xrel) * 0.006f;
+                        g_pitch += float(e.motion.yrel) * 0.006f;
+                        if (g_pitch > 1.4f) g_pitch = 1.4f;
+                        if (g_pitch < -1.4f) g_pitch = -1.4f;
+                    }
+                } else if (e.type == SDL_MOUSEWHEEL) {
+                    g_camDist *= std::pow(0.9f, float(e.wheel.y));
+                    if (g_camDist < 1.05f) g_camDist = 1.05f;
+                    if (g_camDist > 10.0f) g_camDist = 10.0f;
                 }
             }
-            if (!g_paused.load()) g_rotY += 0.004f;
+            if (!g_paused.load() && !g_dragging) g_rotY += 0.004f;
 
             drawFrame(fpsNow);
             SDL_UpdateTexture(g_screenTex, nullptr, g_px.data(), kWinW * 4);

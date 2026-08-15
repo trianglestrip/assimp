@@ -58,7 +58,8 @@ San Miguel（1.14GB OBJ）实测：5.93M 顶点 / 9.98M 三角形 / 2203 meshes 
 
 编译后直接运行（无参数默认加载 San Miguel）：窗口立即打开并显示
 加载进度条，模型按解析进度渐进出现 —— 顶点事件先到（默认灰色），
-材质事件替换 diffuse 颜色，全部完成后显示解析耗时。
+材质事件替换 diffuse 颜色，贴图事件触发并行解码（stb_image），
+随后网格切换到 uv 纹理采样渲染，全部完成后显示解析耗时。
 
 ```bat
 build\Release\assetpack_viewer.exe                # 默认模型
@@ -72,9 +73,15 @@ build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
 - 默认绘制全部三角形（San Miguel 全画约 12fps）；`--tris N` 限制每帧
   预算（超出时按 stride 均匀采样），窗口内 Up/Down 实时增减预算
   （Down 到底 = 全画）。
+- 鼠标交互：左键拖拽旋转视角（拖拽时暂停自动旋转）、滚轮缩放
+  （距离 1.05..10）。
+- 贴图：onTexturesReady 时按 `TexDiffuse` 引用并行 mmap + stb_image
+  解码（San Miguel：323 引用 / 143 MB / 264 张解码 ≈ 9160 万像素），
+  透视校正插值 uv，纹理色与光照 shade 相乘；无贴图的网格回落纯色。
 - `--frames N` 渲染 N 帧退出（`--wait` 时从解析完成开始计）、
   `--shot N file.bmp` 第 N 帧截图、Space 暂停旋转、Esc 退出。
 - 渲染性能与预算追加到 benchmark.md 的 `## render` 小节。
 
 依赖（可选，`ASSETPACK_WITH_VIEWER` 默认 ON）：olive.c 单文件渲染库、
-SDL2 开发包（路径用 `-DOLIVEC_ROOT=... -DSDL2_ROOT=...` 配置）。
+SDL2 开发包、stb_image（已随仓库提供 third_party/stb）；
+路径用 `-DOLIVEC_ROOT=... -DSDL2_ROOT=...` 配置。
