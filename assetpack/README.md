@@ -73,15 +73,17 @@ build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
 - 默认绘制全部三角形（San Miguel 全画约 12fps）；`--tris N` 限制每帧
   预算（超出时按 stride 均匀采样），窗口内 Up/Down 实时增减预算
   （Down 到底 = 全画）。
-- 鼠标交互：左键拖拽旋转视角（拖拽时暂停自动旋转）、滚轮缩放
-  （距离 0.15..10，可贴近模型表面）。
+- 鼠标交互：左键拖拽旋转视角、滚轮缩放（距离 0.15..10，可贴近
+  模型表面）；无自动旋转，WASD 沿视线前进/后退 + 左右平移
+  （步长随缩放距离缩放）。
+- `--untex` 禁用贴图绑定（与贴图版对比查看）。
 - 光照：无光（unlit）直出 —— 顶点色 = 材质 diffuse，纹理路径直接显示
   贴图像素原色（贴图自带烘焙光照），不做光照计算。
 - 贴图：onTexturesReady 时按 `TexDiffuse` 引用并行 mmap + stb_image
   解码（San Miguel：323 引用 / 143 MB / 264 张解码 ≈ 9160 万像素），
   透视校正插值 uv，纹理色与光照 shade 相乘；无贴图的网格回落纯色。
 - `--frames N` 渲染 N 帧退出（`--wait` 时从解析完成开始计）、
-  `--shot N file.bmp` 第 N 帧截图、Space 暂停旋转、Esc 退出。
+  `--shot N file.bmp` 第 N 帧截图、Esc 退出。
 - 渲染性能与预算追加到 benchmark.md 的 `## render` 小节。
 
 依赖（可选，`ASSETPACK_WITH_VIEWER` 默认 ON）：olive.c 单文件渲染库、

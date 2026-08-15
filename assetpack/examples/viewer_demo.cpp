@@ -2,7 +2,7 @@
 // renderer.
 //
 // Usage:  assetpack_viewer [model.obj] [--frames N] [--tris N] [--wait]
-//                          [--shot N file.bmp]
+//                          [--shot N file.bmp] [--untex]
 //
 // With no model argument the default scene (San Miguel) is loaded, so the
 // built viewer opens a window immediately and streams the model in as the
@@ -12,8 +12,9 @@
 // By default every triangle is drawn (no sampling); --tris N caps the
 // per-frame triangle budget (stride-sampled), Up/Down adjust it live.
 //
-// Keys: Esc quit | Space pause rotation | Up/Down triangle budget x2 / /2
+// Keys: Esc quit | Up/Down triangle budget x2 / /2
 // Mouse: drag = orbit | wheel = zoom
+// WASD: move along the view axis / strafe
 
 #include "olive_bridge.h"
 
@@ -86,6 +87,7 @@ std::vector<ap::PackMaterial> g_materials;       // materials snapshot (string_v
 std::vector<ViewerTex> g_texs;                   // decoded diffuse textures
 std::unordered_map<std::string_view, int> g_texByPath;  // mtl path -> g_texs index
 std::vector<int> g_meshTex;                      // per-mesh texture index or -1
+bool g_noTex = false;                            // --untex: disable textures
 std::atomic<uint64_t> g_texPixels{0};            // decoded pixel count
 
 // ---- scene / camera ----
@@ -93,10 +95,10 @@ float g_scale = 1.f;
 float g_center[3] = {0, 0, 0};
 float g_camDist = 2.2f;
 float g_rotY = 0.6f, g_pitch = 0.35f;
-std::atomic<bool> g_paused{false};
 std::atomic<bool> g_quit{false};
 bool g_dragging = false;                   // left-button orbit in progress
 int g_mouseX = 0, g_mouseY = 0;
+float g_offX = 0.f, g_offZ = 0.f;          // WASD view-space offsets
 int g_triBudget = 0;                       // triangles/frame, 0 = draw all (--tris)
 int g_lastStride = 1;
 bool g_cullChecked = false;                // winding probe (set once, first frame)
@@ -334,9 +336,9 @@ static void drawFrame(double fpsNow) {
                 const float x1 = cY * px + sY * pz;
                 const float z1 = -sY * px + cY * pz;
                 float* d = g_tv.data() + 6 * i;
-                d[0] = x1;
+                d[0] = x1 + g_offX;
                 d[1] = cP * py - sP * z1;
-                d[2] = sP * py + cP * z1 + dist;
+                d[2] = sP * py + cP * z1 + dist + g_offZ;
             }
         });
     }
@@ -397,7 +399,7 @@ static void drawFrame(double fpsNow) {
                   (unsigned long long)(nTris / uint64_t(stride)), stride,
                   fpsNow);
     obv_text(c, info, 10, 10, obv_default_font(), 2, kText);
-    obv_text(c, "drag: orbit   wheel: zoom   Space: pause", 10, 30,
+    obv_text(c, "drag: orbit   wheel: zoom   WASD: move", 10, 30,
              obv_default_font(), 2, kText);
 }
 
@@ -450,6 +452,10 @@ static void saveBmp(const std::string& path) {
 // texture slot. Idempotent: called from every event that may complete
 // the materials/textures picture.
 static void bindTextures() {
+    if (g_noTex) {
+        g_meshTex.assign(g_meshTex.size(), -1);
+        return;
+    }
     if (g_materials.empty() || g_meshTex.empty() || g_texByPath.empty()) return;
     g_meshTex.assign(g_meshTex.size(), -1);
     for (size_t i = 0; i < g_meshes.size(); ++i) {
@@ -663,6 +669,7 @@ int main(int argc, char** argv) {
         if (a == "--frames" && i + 1 < argc) g_frames = std::atoi(argv[++i]);
         else if (a == "--tris" && i + 1 < argc) g_triBudget = std::atoi(argv[++i]);
         else if (a == "--wait") g_waitAll = true;
+        else if (a == "--untex") g_noTex = true;
         else if (a == "--shot" && i + 2 < argc) {
             g_shotAt = std::atoi(argv[i + 1]);
             g_shotFile = argv[i + 2];
@@ -715,7 +722,6 @@ int main(int argc, char** argv) {
                 } else if (e.type == SDL_KEYDOWN) {
                     switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE: g_quit.store(true); break;
-                    case SDLK_SPACE: g_paused.store(!g_paused.load()); break;
                     case SDLK_UP:   // raise the budget; 0 = draw all
                         g_triBudget = g_triBudget <= 0
                                           ? 100000
@@ -748,7 +754,14 @@ int main(int argc, char** argv) {
                     if (g_camDist > 10.0f) g_camDist = 10.0f;
                 }
             }
-            if (!g_paused.load() && !g_dragging) g_rotY += 0.004f;
+            // WASD: move along the view axis (W/S) and strafe (A/D);
+            // the step scales with the current zoom distance
+            const Uint8* ks = SDL_GetKeyboardState(nullptr);
+            const float step = 0.02f * g_camDist;
+            if (ks[SDL_SCANCODE_W]) g_offZ -= step;
+            if (ks[SDL_SCANCODE_S]) g_offZ += step;
+            if (ks[SDL_SCANCODE_A]) g_offX += step;
+            if (ks[SDL_SCANCODE_D]) g_offX -= step;
 
             drawFrame(fpsNow);
             SDL_UpdateTexture(g_screenTex, nullptr, g_px.data(), kWinW * 4);
