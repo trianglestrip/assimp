@@ -74,7 +74,9 @@ build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
   预算（超出时按 stride 均匀采样），窗口内 Up/Down 实时增减预算
   （Down 到底 = 全画）。
 - 鼠标交互：左键拖拽旋转视角（拖拽时暂停自动旋转）、滚轮缩放
-  （距离 1.05..10）。
+  （距离 0.15..10，可贴近模型表面）。
+- 光照：暖色主光 + 冷色补光双光源（逐通道调制）+ 20% 环境光，
+  逐顶点 Gouraud 着色，纹理色与光照相乘。
 - 贴图：onTexturesReady 时按 `TexDiffuse` 引用并行 mmap + stb_image
   解码（San Miguel：323 引用 / 143 MB / 264 张解码 ≈ 9160 万像素），
   透视校正插值 uv，纹理色与光照 shade 相乘；无贴图的网格回落纯色。

@@ -156,19 +156,22 @@ struct ShadeV {                   // one projected vertex
     float u, v;                   // texture coordinates (textured meshes)
 };
 
-static uint32_t shadeColor(uint32_t rgb, float s) {
-    const uint32_t r = uint32_t(((rgb >> 16) & 255) * s + 0.5f);
-    const uint32_t g = uint32_t(((rgb >> 8) & 255) * s + 0.5f);
-    const uint32_t b = uint32_t((rgb & 255) * s + 0.5f);
+static uint32_t litColor(uint32_t rgb, float nx, float ny, float nz) {
+    // two-light rig: warm key from above-front, cool fill from the
+    // opposite lower side, 20% ambient; per-channel to keep the tint
+    constexpr float kAx = -0.32f, kAy = 0.60f, kAz = 0.735f;
+    constexpr float fAx = 0.45f, fAy = -0.35f, fAz = 0.82f;
+    const float dk = nx * kAx + ny * kAy + nz * kAz;
+    const float df = nx * fAx + ny * fAy + nz * fAz;
+    const float key = dk > 0.f ? dk : 0.f;
+    const float fill = df > 0.f ? df : 0.f;
+    const float fr = 0.20f + 0.65f * key + 0.22f * fill;
+    const float fg = 0.20f + 0.60f * key + 0.26f * fill;
+    const float fb = 0.20f + 0.50f * key + 0.34f * fill;
+    const uint32_t r = uint32_t(((rgb >> 16) & 255) * fr + 0.5f);
+    const uint32_t g = uint32_t(((rgb >> 8) & 255) * fg + 0.5f);
+    const uint32_t b = uint32_t((rgb & 255) * fb + 0.5f);
     return 0xFF000000u | (r << 16) | (g << 8) | b;
-}
-
-static float shadeDot(float nx, float ny, float nz) {
-    // key light from above-front (normalized -0.35, 0.65, 0.8), 25% ambient
-    constexpr float lx = -0.32f, ly = 0.60f, lz = 0.735f;
-    const float d = nx * lx + ny * ly + nz * lz;
-    const float s = (d < 0.f ? 0.f : (d > 1.f ? 1.f : d)) * 0.75f + 0.25f;
-    return s;
 }
 
 static void rasterTri(uint32_t* px, float* zb, int W, int H,
@@ -283,9 +286,9 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
             sC.w = icx;
             float shA, shB, shC;
             if (hasNrm) {
-                shA = shadeDot(A[3], A[4], A[5]);
-                shB = shadeDot(B[3], B[4], B[5]);
-                shC = shadeDot(C[3], C[4], C[5]);
+                sA.c = litColor(mat, A[3], A[4], A[5]);
+                sB.c = litColor(mat, B[3], B[4], B[5]);
+                sC.c = litColor(mat, C[3], C[4], C[5]);
             } else {
                 // face normal (cross product of the edges)
                 const float nx = (by - ay) * (cz - az) - (bz - az) * (cy - ay);
@@ -293,12 +296,8 @@ static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
                 const float nz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
                 const float inv =
                     1.f / std::sqrt(nx * nx + ny * ny + nz * nz);
-                const float sh = shadeDot(nx * inv, ny * inv, nz * inv);
-                shA = shB = shC = sh;
+                sA.c = sB.c = sC.c = litColor(mat, nx * inv, ny * inv, nz * inv);
             }
-            sA.c = shadeColor(mat, shA);
-            sB.c = shadeColor(mat, shB);
-            sC.c = shadeColor(mat, shC);
             if (tc) {
                 sA.u = tc[ia * 2];
                 sA.v = tc[ia * 2 + 1];
@@ -788,7 +787,7 @@ int main(int argc, char** argv) {
                     }
                 } else if (e.type == SDL_MOUSEWHEEL) {
                     g_camDist *= std::pow(0.9f, float(e.wheel.y));
-                    if (g_camDist < 1.05f) g_camDist = 1.05f;
+                    if (g_camDist < 0.15f) g_camDist = 0.15f;
                     if (g_camDist > 10.0f) g_camDist = 10.0f;
                 }
             }
