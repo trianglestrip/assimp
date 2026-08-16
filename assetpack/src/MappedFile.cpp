@@ -62,4 +62,14 @@ std::shared_ptr<MappedFile> MappedFile::openShared(std::string_view path) {
     return f;
 }
 
+std::span<const std::byte> MappedFile::bytes() const { return bytes_; }
+
+bool MappedFile::isOpen() const { return bytes_.data() != nullptr; }
+
+size_t MappedFile::size() const { return bytes_.size(); }
+
+std::string_view MappedFile::text() const {
+    return { reinterpret_cast<const char*>(bytes_.data()), bytes_.size() };
+}
+
 } // namespace ag

@@ -65,6 +65,50 @@ std::unique_ptr<ModelParser> ParserRegistry::createForPath(
     return create(pathFormat(path), threads);
 }
 
+// ---- data contract + ModelParser method definitions ----
+// Declared in the umbrella header; defined here so the header stays
+// declaration-only (consumers link one out-of-line copy, and the ABI
+// no longer depends on their definition).
+
+const char* texTypeName(int t) {
+    switch (t) {
+    case TexDiffuse:  return "diffuse";
+    case TexAmbient:  return "ambient";
+    case TexSpecular: return "specular";
+    case TexEmissive: return "emissive";
+    case TexOpacity:  return "opacity";
+    case TexNormal:   return "normal";
+    default:          return "?";
+    }
+}
+
+uint32_t PackMesh::vertexCount()  const { return uint32_t(positions.size() / 3); }
+uint32_t PackMesh::triangleCount() const { return uint32_t(indices.size() / 3); }
+
+const std::string& ModelParser::lastError() const { return lastError_; }
+
+void ModelParser::setOnVerticesReady(VerticesReady cb)   { onVerts_ = std::move(cb); }
+void ModelParser::setOnMaterialsReady(MaterialsReady cb) { onMats_  = std::move(cb); }
+void ModelParser::setOnTexturesReady(TexturesReady cb)   { onTexs_  = std::move(cb); }
+void ModelParser::setOnAllDone(AllDone cb)               { onAll_   = std::move(cb); }
+void ModelParser::setProgress(Progress cb)               { onProgress_ = std::move(cb); }
+
+void ModelParser::fireVertices(PackResult& r, std::span<const PackMesh> m) const {
+    if (onVerts_) onVerts_(r, m);
+}
+void ModelParser::fireMaterials(PackResult& r, std::span<const PackMaterial> m) const {
+    if (onMats_) onMats_(r, m);
+}
+void ModelParser::fireTextures(PackResult& r, std::span<const PackTexture> t) const {
+    if (onTexs_) onTexs_(r, t);
+}
+void ModelParser::fireAllDone(PackResult& r, bool ok, std::string_view err) const {
+    if (onAll_) onAll_(r, ok, err);
+}
+void ModelParser::fireProgress(float pct) const {
+    if (onProgress_) onProgress_(pct);
+}
+
 // ---- AssetPack facade ----
 
 AssetPack::AssetPack(unsigned threads)
@@ -75,6 +119,13 @@ AssetPack::AssetPack(unsigned threads)
 AssetPack::~AssetPack() = default;
 
 void AssetPack::setFormat(std::string_view fmt) { format_ = std::string(fmt); }
+
+void AssetPack::setOnVerticesReady(VerticesReady cb)   { onVerts_ = std::move(cb); }
+void AssetPack::setOnMaterialsReady(MaterialsReady cb) { onMats_  = std::move(cb); }
+void AssetPack::setOnTexturesReady(TexturesReady cb)   { onTexs_  = std::move(cb); }
+void AssetPack::setOnAllDone(AllDone cb)               { onAll_   = std::move(cb); }
+void AssetPack::setProgress(Progress cb)               { onProgress_ = std::move(cb); }
+void AssetPack::setWantNormals(bool want)              { wantNormals_ = want; }
 
 bool AssetPack::ensureParser(std::string_view path) {
     if (parser_) return true;

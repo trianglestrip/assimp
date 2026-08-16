@@ -63,15 +63,13 @@ public:
     bool open(std::string_view path);
 
     // View over the whole file. Empty if not open.
-    std::span<const std::byte> bytes() const { return bytes_; }
+    std::span<const std::byte> bytes() const;
 
-    bool isOpen() const { return bytes_.data() != nullptr; }
-    size_t size() const { return bytes_.size(); }
+    bool isOpen() const;
+    size_t size() const;
 
     // Convenience: reinterpret the mapping as chars
-    std::string_view text() const {
-        return { reinterpret_cast<const char*>(bytes_.data()), bytes_.size() };
-    }
+    std::string_view text() const;
 
     // Shared ownership so views can outlive the loader object.
     static std::shared_ptr<MappedFile> openShared(std::string_view path);
@@ -104,17 +102,7 @@ enum TexType : int {
     TexCount
 };
 
-inline const char* texTypeName(int t) {
-    switch (t) {
-    case TexDiffuse:  return "diffuse";
-    case TexAmbient:  return "ambient";
-    case TexSpecular: return "specular";
-    case TexEmissive: return "emissive";
-    case TexOpacity:  return "opacity";
-    case TexNormal:   return "normal";
-    default:          return "?";
-    }
-}
+const char* texTypeName(int t);
 
 // ---- vertices section (one entry per mesh/group) ----
 struct PackMesh {
@@ -129,8 +117,8 @@ struct PackMesh {
     float boundsMin[3] = {0,0,0};
     float boundsMax[3] = {0,0,0};
 
-    uint32_t vertexCount()  const { return uint32_t(positions.size() / 3); }
-    uint32_t triangleCount() const { return uint32_t(indices.size() / 3); }
+    uint32_t vertexCount()  const;
+    uint32_t triangleCount() const;
 };
 
 // ---- materials section ----
@@ -204,13 +192,13 @@ public:
     ModelParser& operator=(const ModelParser&) = delete;
 
     // last parse error (empty when the load succeeded)
-    const std::string& lastError() const { return lastError_; }
+    const std::string& lastError() const;
 
-    void setOnVerticesReady(VerticesReady cb)   { onVerts_ = std::move(cb); }
-    void setOnMaterialsReady(MaterialsReady cb) { onMats_  = std::move(cb); }
-    void setOnTexturesReady(TexturesReady cb)   { onTexs_  = std::move(cb); }
-    void setOnAllDone(AllDone cb)               { onAll_   = std::move(cb); }
-    void setProgress(Progress cb)               { onProgress_ = std::move(cb); }
+    void setOnVerticesReady(VerticesReady cb);
+    void setOnMaterialsReady(MaterialsReady cb);
+    void setOnTexturesReady(TexturesReady cb);
+    void setOnAllDone(AllDone cb);
+    void setProgress(Progress cb);
 
     // Blocking load; events fire before returning.
     virtual bool load(std::string_view path) = 0;
@@ -226,21 +214,11 @@ public:
 
 protected:
     // subclasses call these when a stage completes
-    void fireVertices(PackResult& r, std::span<const PackMesh> m) const {
-        if (onVerts_) onVerts_(r, m);
-    }
-    void fireMaterials(PackResult& r, std::span<const PackMaterial> m) const {
-        if (onMats_) onMats_(r, m);
-    }
-    void fireTextures(PackResult& r, std::span<const PackTexture> t) const {
-        if (onTexs_) onTexs_(r, t);
-    }
-    void fireAllDone(PackResult& r, bool ok, std::string_view err) const {
-        if (onAll_) onAll_(r, ok, err);
-    }
-    void fireProgress(float pct) const {
-        if (onProgress_) onProgress_(pct);
-    }
+    void fireVertices(PackResult& r, std::span<const PackMesh> m) const;
+    void fireMaterials(PackResult& r, std::span<const PackMaterial> m) const;
+    void fireTextures(PackResult& r, std::span<const PackTexture> t) const;
+    void fireAllDone(PackResult& r, bool ok, std::string_view err) const;
+    void fireProgress(float pct) const;
 
     // shared parser state: result storage + error text. Subclasses
     // allocate result_ at load start and report failures through
@@ -319,15 +297,15 @@ public:
     // default the extension of the path passed to load() decides.
     void setFormat(std::string_view fmt);
 
-    void setOnVerticesReady(VerticesReady cb)   { onVerts_ = std::move(cb); }
-    void setOnMaterialsReady(MaterialsReady cb) { onMats_  = std::move(cb); }
-    void setOnTexturesReady(TexturesReady cb)   { onTexs_  = std::move(cb); }
-    void setOnAllDone(AllDone cb)               { onAll_   = std::move(cb); }
-    void setProgress(Progress cb)               { onProgress_ = std::move(cb); }
+    void setOnVerticesReady(VerticesReady cb);
+    void setOnMaterialsReady(MaterialsReady cb);
+    void setOnTexturesReady(TexturesReady cb);
+    void setOnAllDone(AllDone cb);
+    void setProgress(Progress cb);
 
     // Parser attribute opt-outs (applied to the parser the facade
     // creates; ignored by parsers without the section)
-    void setWantNormals(bool want)              { wantNormals_ = want; }
+    void setWantNormals(bool want);
 
     // Blocking load; events fire before returning.
     bool load(std::string_view path);
