@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -250,19 +251,29 @@ struct DxRenderer::Impl {
     }
 
     // ---- geometry streaming (parse-overlapped upload) ----
-    // Own list/allocator/staging ring/fence so the upload thread never
-    // touches the per-frame path; copies are submitted in ~64 MB
-    // batches and the ring cycles once the GPU finishes each slot.
+    // Own lists/allocators/staging ring/fence so the upload workers
+    // never touch the per-frame path; copies are submitted in ~64 MB
+    // batches. kGeoBatches lists rotate so a flush never waits on the
+    // batch it just submitted - the GPU drains them in order while the
+    // workers keep recording, and a wait happens only when the ring
+    // itself is exhausted (every batch still in flight).
     static constexpr size_t kSlotCap = 32u << 20;   // staging slot
     static constexpr UINT kSlots = 8;               // ring depth (256 MB)
+    static constexpr UINT kGeoBatches = 3;          // in-flight batch depth
     struct StageSlot {
         ComPtr<ID3D12Resource> res;
         void* mapped = nullptr;
-        size_t used = 0;
+        size_t used = 0;      // bytes recorded into the open batch
+        size_t reserved = 0;  // bytes claimed, memcpy in progress (unlocked)
         UINT64 fenceAt = 0;   // batch whose copies this slot feeds
     };
-    ComPtr<ID3D12CommandAllocator> geoAlloc;
-    ComPtr<ID3D12GraphicsCommandList> geoList;
+    struct GeoBatch {
+        ComPtr<ID3D12CommandAllocator> alloc;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        UINT64 fenceAt = 0;   // submit fence; 0 = not in flight
+    };
+    std::array<GeoBatch, kGeoBatches> batches;
+    UINT geoBatchIdx = 0;
     ComPtr<ID3D12Fence> geoFence;
     HANDLE geoFenceEvt = nullptr;
     UINT64 geoFenceVal = 0;
@@ -270,7 +281,8 @@ struct DxRenderer::Impl {
     UINT stageIdx = 0;
     UINT64 geoPending = 0;   // bytes recorded since the last submit
     bool geoOpen = false;
-    std::mutex geoMx;   // upload thread vs finalize (list + ring)
+    std::mutex geoMx;   // upload workers vs finalize (list + ring)
+    std::condition_variable geoSlotsCv;   // reserved-slot drain notify
 
     void waitGeo(UINT64 v) {
         if (geoFence->GetCompletedValue() >= v) return;
@@ -278,7 +290,10 @@ struct DxRenderer::Impl {
         WaitForSingleObject(geoFenceEvt, INFINITE);
     }
 
-    void advanceStage() {   // caller holds geoMx
+    // caller holds geoMx and has ensured the current slot is full with
+    // nothing reserved (a slot a publisher is still memcpy'ing into is
+    // never recycled)
+    void advanceStage() {
         StageSlot& s = stages[stageIdx];
         if (s.fenceAt) waitGeo(s.fenceAt);
         s.fenceAt = 0;
@@ -286,23 +301,33 @@ struct DxRenderer::Impl {
         stageIdx = (stageIdx + 1) % kSlots;
     }
 
-    // submit the recorded copies so the GPU can drain the ring; the
-    // single allocator is reused only after the batch just submitted
-    // completes, so exactly one batch is in flight at a time (the GPU
-    // copies 64 MB in ~5 ms while the CPU memcpy takes ~20 ms, so the
-    // ring still gives the CPU its head start)
+    // submit the recorded copies so the GPU can drain the ring, then
+    // rotate to the next list. A batch is waited only when it is next
+    // picked up again - two flushes later - so the GPU copy (~5 ms per
+    // 64 MB) overlaps the workers' recording instead of serializing it.
     void flushGeoBatch() {   // caller holds geoMx
-        geoList->Close();
-        ID3D12CommandList* lists[] = {geoList.Get()};
+        GeoBatch& b = batches[geoBatchIdx];
+        b.list->Close();
+        ID3D12CommandList* lists[] = {b.list.Get()};
         queue->ExecuteCommandLists(1, lists);
         ++geoFenceVal;
         queue->Signal(geoFence.Get(), geoFenceVal);
-        waitGeo(geoFenceVal);
-        for (StageSlot& s : stages)
-            if (s.used) s.fenceAt = geoFenceVal;
+        b.fenceAt = geoFenceVal;
+        // every slot, not just the ones with bytes recorded this batch:
+        // a slot vacated mid-batch keeps its bytes in the list just
+        // submitted, and a stale fence would let advanceStage recycle
+        // it while the GPU still reads it. Over-waiting one batch is
+        // harmless; under-waiting corrupts.
+        for (StageSlot& s : stages) s.fenceAt = geoFenceVal;
         geoPending = 0;
-        geoAlloc->Reset();
-        geoList->Reset(geoAlloc.Get(), nullptr);
+        geoBatchIdx = (geoBatchIdx + 1) % kGeoBatches;
+        GeoBatch& nb = batches[geoBatchIdx];
+        if (nb.fenceAt) {
+            waitGeo(nb.fenceAt);   // ring exhausted: GPU fell behind
+            nb.fenceAt = 0;
+        }
+        nb.alloc->Reset();
+        nb.list->Reset(nb.alloc.Get(), nullptr);
     }
 
     void geoBarrier(ID3D12Resource* r, D3D12_RESOURCE_STATES a,
@@ -313,7 +338,7 @@ struct DxRenderer::Impl {
         br.Transition.Subresource = 0;
         br.Transition.StateBefore = a;
         br.Transition.StateAfter = b;
-        geoList->ResourceBarrier(1, &br);
+        batches[geoBatchIdx].list->ResourceBarrier(1, &br);
     }
 
     // scene PSO (shaders compiled at init; PSO built once at the first
@@ -1013,8 +1038,10 @@ void DxRenderer::shutdown() {
     }
     if (dx.geoFenceEvt) CloseHandle(dx.geoFenceEvt);
     dx.geoFenceEvt = nullptr;
-    dx.geoList.Reset();
-    dx.geoAlloc.Reset();
+    for (Impl::GeoBatch& b : dx.batches) {
+        b.list.Reset();
+        b.alloc.Reset();
+    }
     dx.geoFence.Reset();
     dx.geoOpen = false;
     dx.pso.Reset();
@@ -1135,14 +1162,16 @@ void DxRenderer::beginGeometryStream(size_t verts, size_t tris, bool hasUv) {
                          D3D12_RESOURCE_STATE_COPY_DEST);
     dx.ib = dx.makeBuf(ibBytes, D3D12_HEAP_TYPE_DEFAULT,
                        D3D12_RESOURCE_STATE_COPY_DEST);
-    // dedicated list/fence + staging ring for the upload thread
-    dx.chk(dx.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                          IID_PPV_ARGS(&dx.geoAlloc)),
-           "geo alloc");
-    dx.chk(dx.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                     dx.geoAlloc.Get(), nullptr,
-                                     IID_PPV_ARGS(&dx.geoList)),
-           "geo list");
+    // dedicated lists/fence + staging ring for the upload workers
+    for (UINT i = 0; i < Impl::kGeoBatches; ++i) {
+        dx.chk(dx.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              IID_PPV_ARGS(&dx.batches[i].alloc)),
+               "geo alloc");
+        dx.chk(dx.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         dx.batches[i].alloc.Get(), nullptr,
+                                         IID_PPV_ARGS(&dx.batches[i].list)),
+               "geo list");
+    }
     dx.geoFenceEvt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     dx.chk(dx.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
                                IID_PPV_ARGS(&dx.geoFence)),
@@ -1183,25 +1212,55 @@ void DxRenderer::stageGeometryRange(ap::GeoRangeKind kind,
                               ? dx.vbUv.Get()
                               : kind == ap::GeoRangeKind::Idx ? dx.ib.Get()
                                                               : dx.vbPos.Get();
-    std::lock_guard<std::mutex> lk(dx.geoMx);
     size_t off = 0;
     while (off < sizeBytes) {
-        Impl::StageSlot& s = dx.stages[dx.stageIdx];
-        if (s.used >= Impl::kSlotCap) dx.advanceStage();
-        const size_t chunk =
-            std::min(sizeBytes - off, Impl::kSlotCap - s.used);
-        char* slot = static_cast<char*>(s.mapped) + s.used;
+        // claim a disjoint slice of a staging slot under the lock, then
+        // memcpy outside it: 16 parser workers otherwise serialize their
+        // ~GB/s staging writes behind geoMx. The reserved count keeps
+        // advanceStage from recycling a slot a publisher is still
+        // writing into; the cv wakes claimers when a reserved slot drains.
+        char* slot = nullptr;
+        size_t chunk = 0;
+        size_t srcOff = 0;   // staging offset of this chunk (claimed below)
+        UINT slotIdx = 0;
+        {
+            std::unique_lock<std::mutex> lk(dx.geoMx);
+            for (;;) {
+                Impl::StageSlot& s = dx.stages[dx.stageIdx];
+                if (s.used + s.reserved < Impl::kSlotCap) {
+                    const size_t avail =
+                        Impl::kSlotCap - s.used - s.reserved;
+                    chunk = std::min(sizeBytes - off, avail);
+                    srcOff = s.used + s.reserved;
+                    slot = static_cast<char*>(s.mapped) + srcOff;
+                    slotIdx = dx.stageIdx;
+                    s.reserved += chunk;
+                    break;
+                }
+                if (s.reserved) {
+                    dx.geoSlotsCv.wait(lk);   // re-check on notify
+                    continue;
+                }
+                dx.advanceStage();
+            }
+        }
         if (data) {
             memcpy(slot, static_cast<const char*>(data) + off, chunk);
         } else {
             memset(slot, 0, chunk);   // models without texcoords
         }
-        dx.geoList->CopyBufferRegion(dst, offsetBytes + off, s.res.Get(),
-                                     s.used, chunk);
-        s.used += chunk;
-        dx.geoPending += chunk;
-        off += chunk;
-        if (dx.geoPending >= (64u << 20)) dx.flushGeoBatch();
+        {
+            std::lock_guard<std::mutex> lk(dx.geoMx);
+            Impl::StageSlot& s = dx.stages[slotIdx];
+            s.reserved -= chunk;
+            s.used += chunk;
+            if (s.reserved == 0) dx.geoSlotsCv.notify_all();
+            dx.batches[dx.geoBatchIdx].list->CopyBufferRegion(
+                dst, offsetBytes + off, s.res.Get(), srcOff, chunk);
+            dx.geoPending += chunk;
+            off += chunk;
+            if (dx.geoPending >= (64u << 20)) dx.flushGeoBatch();
+        }
     }
 }
 

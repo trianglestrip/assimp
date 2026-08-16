@@ -228,6 +228,18 @@ void GeometryStage::run(tf::Subflow& sf) {
             c.basePos = p; c.baseNrm = n; c.baseUv = u; c.baseTri = t;
             p += c.nPos; n += c.nNrm; u += c.nUv; t += c.nTri;
         }
+        // geometry streaming: publish the buffer plan as soon as the
+        // counts are known (the split count is still unknown, so files
+        // with vt lines reserve one extra vertex per base vertex -
+        // covers every real model, and seamFill skips splits that would
+        // overflow). Firing early lets the consumer create its buffers
+        // (a few hundred ms of D3D12 resource allocation) overlap the
+        // pool allocation below instead of delaying pass 2's publish.
+        const GeoStreamSink& sink = owner_.geoStream();
+        if (sink.onMeta) {
+            const size_t cap = u ? p * 2 : p;   // split capacity
+            sink.onMeta(cap, t, u > 0);
+        }
         // thread the running usemtl across chunk boundaries so pass2 can
         // skip seam-splitting for untextured materials; markers are
         // position-ordered, so a marker at chunk start covers no faces
@@ -260,17 +272,6 @@ void GeometryStage::run(tf::Subflow& sf) {
         for (detail::SeamShard& sh : *shards) {
             sh.seed(1u << 17);
             sh.added.reserve(1u << 17);
-        }
-        // geometry streaming: publish the buffer plan now (the split
-        // count is still unknown, so files with vt lines reserve one
-        // extra vertex per base vertex - covers every real model, and
-        // seamFill skips splits that would overflow). Pass 2 chunks
-        // publish their pos/idx ranges as they finish, so the consumer
-        // copies while the rest of the file still parses.
-        const GeoStreamSink& sink = owner_.geoStream();
-        if (sink.onMeta) {
-            const size_t cap = u ? p * 2 : p;   // split capacity
-            sink.onMeta(cap, t, u > 0);
         }
         AP_LOG("geometry", "pass1: %zu v / %zu vn / %zu vt / %zu tris",
                p, n, u, t);
@@ -468,28 +469,6 @@ void GeometryStage::run(tf::Subflow& sf) {
             if (!result->texcoords.empty())
                 result->texcoords.resize((base + n) * 2);
         }
-        // geometry streaming: the meta (buffer plan) went out from the
-        // prefix task; pass2 chunks already published their pos/idx
-        // ranges, so only the seam-split range is new here. The prefix
-        // plan reserved one extra vertex per base vertex when the file
-        // has vt lines; a split count beyond that would overflow the
-        // GPU buffer, so cap the publish at the reserved capacity.
-        const GeoStreamSink& sink = owner_.geoStream();
-        if (n && sink.onRange && !result->texcoords.empty()) {
-            const size_t cap = uvPool->empty() ? base : base * 2;
-            if (base + n <= cap) {
-                sink.onRange(GeoRangeKind::Pos, base * 12,
-                             result->positions.data() + base * 3,
-                             n * 12);
-                sink.onRange(GeoRangeKind::Uv, base * 8,
-                             result->texcoords.data() + base * 2, n * 8);
-            } else {
-                AP_LOG("geometry",
-                       "seam splits exceed streamed capacity (%zu>%zu); "
-                       "split verts not uploaded",
-                       n, cap - base);
-            }
-        }
         if (!n) return;
         // flatten the shard lists (cheap pointer gather), then fill
         // in parallel: entries write disjoint output slots
@@ -525,6 +504,30 @@ void GeometryStage::run(tf::Subflow& sf) {
             }
         });
         inner.join();
+        // geometry streaming: the meta (buffer plan) went out from the
+        // prefix task; pass2 chunks already published their pos/idx
+        // ranges, so only the seam-split range is new here. The prefix
+        // plan reserved one extra vertex per base vertex when the file
+        // has vt lines; a split count beyond that would overflow the
+        // GPU buffer, so cap the publish at the reserved capacity.
+        // Published here, after the fill: earlier would stream the
+        // zero-initialized tail from the resizes above.
+        const GeoStreamSink& sink = owner_.geoStream();
+        if (sink.onRange && !result->texcoords.empty()) {
+            const size_t cap = uvPool->empty() ? base : base * 2;
+            if (base + n <= cap) {
+                sink.onRange(GeoRangeKind::Pos, base * 12,
+                             result->positions.data() + base * 3,
+                             n * 12);
+                sink.onRange(GeoRangeKind::Uv, base * 8,
+                             result->texcoords.data() + base * 2, n * 8);
+            } else {
+                AP_LOG("geometry",
+                       "seam splits exceed streamed capacity (%zu>%zu); "
+                       "split verts not uploaded",
+                       n, cap - base);
+            }
+        }
         AP_LOG("geometry", "seam split: %zu extra vertices (%zu -> %zu)",
                n, base, base + n);
     });
