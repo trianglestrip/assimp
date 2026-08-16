@@ -1,30 +1,33 @@
-// assetpack_viewer - bind assetpack parse events to the olive.c software
-// renderer.
+// assetpack_viewer - DX12-GPU-only viewer. Parser events feed texp::TexPipeline
+// (TexPipeline.h), the parallel mmap + stb_image texture decode, and DxRenderer
+// (DxRenderer.h), which owns the device, swapchain, scene PSO and the
+// DirectXTK12 display layer. Overlays (HUD strip, loading frame) rasterize
+// on a taskflow executor and upload as textures.
 //
-// Usage:  assetpack_viewer [model.obj] [--frames N] [--tris N] [--wait]
-//                          [--shot N file.bmp] [--untex]
-//
+// Usage:  assetpack_viewer [model.obj] [--frames N] [--wait]
+//                          [--shot N file.bmp] [--untex] [--warp]
 // With no model argument the default scene (San Miguel) is loaded, so the
 // built viewer opens a window immediately and streams the model in as the
 // parser stages complete: vertices first (meshes appear, default colors),
 // then materials (diffuse colors), then textures (decoded in parallel with
 // stb_image and applied via uv sampling).
-// By default every triangle is drawn (no sampling); --tris N caps the
-// per-frame triangle budget (stride-sampled), Up/Down adjust it live.
 //
-// Keys: Esc quit | Up/Down triangle budget x2 / /2 | T textures on/off
+// Keys: Esc quit | T textures on/off
 // Mouse: drag = orbit | wheel = zoom
-// WASD: move along the view axis / strafe
-
-#include "olive_bridge.h"
+// WASD: move along the view axis / strafe | Q/E: camera height
 
 #include <assetpack/AssetPack.h>
 #include <assetpack/Log.h>
 
 #include <SDL2/SDL.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb/stb_image.h>
+#include "TexPipeline.h"     // parallel texture decode (mmap + stb_image)
+#include "DxRenderer.h"      // D3D12 backend (device, PSOs, uploads)
+
+#include <taskflow/taskflow.hpp>   // display-side CPU jobs run as tasks too
+
+#define STB_TRUETYPE_IMPLEMENTATION
+#include <stb/stb_truetype.h>      // TrueType HUD/loading text (Consolas)
 
 #include <algorithm>
 #include <atomic>
@@ -36,11 +39,11 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
-#include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -49,7 +52,6 @@ using Clock = std::chrono::steady_clock;
 
 constexpr int kWinW = 960;
 constexpr int kWinH = 720;
-constexpr int kThreads = 16;
 constexpr const char* kDefaultModel =
     "F:/project/meshToBrowser/models/San_Miguel/san-miguel.obj";
 
@@ -58,37 +60,42 @@ constexpr uint32_t kSlot   = 0xFF2E2E2E;   // loading bar slot
 constexpr uint32_t kBar    = 0xFF2E8B57;   // loading bar fill
 constexpr uint32_t kText   = 0xFF9A9A9A;
 constexpr uint32_t kColor0 = 0xFF8888A8;   // default mesh color (before materials)
+constexpr const char* kHudHelp =
+    "drag: orbit   wheel: zoom   WASD: move   Q/E: height   T: textures";
 
-// ---- window / framebuffers ----
-SDL_Window*   g_win = nullptr;
-SDL_Renderer* g_renderer = nullptr;
-SDL_Texture*  g_screenTex = nullptr;
-std::vector<uint32_t> g_px;                // presented framebuffer (ARGB)
-std::vector<uint32_t> g_tpx[kThreads];     // per-raster-thread pixel buffers
-std::vector<float>    g_tzb[kThreads];     // per-raster-thread depth buffers
+// ---- window / loading overlay ----
+SDL_Window* g_win = nullptr;
+
+// display-side taskflow: HUD/loading rasterization runs here so the
+// render thread never pays the text rasterization or swizzle on its
+// critical path (one worker pool for the viewer's whole lifetime)
+tf::Executor g_tf;
+
+// latest-completed handoff for the two overlays: a task rasterizes into
+// a private buffer and parks it here; the render loop consumes (moves)
+// it, so stale results are dropped and the pointer stays owned through
+// the GPU upload of that frame
+std::mutex g_ovlMx;
+std::shared_ptr<std::vector<unsigned char>> g_hudLatest;
+std::shared_ptr<std::vector<uint32_t>> g_loadLatest;
+std::atomic<bool> g_hudBusy{false}, g_loadBusy{false};
+std::string g_hudSubmitted;
+int g_loadPct = -1;
 
 // ---- parser event data (spans point into parser-owned pools) ----
 std::vector<ap::PackMesh> g_meshes;
 std::vector<uint32_t> g_matColor;          // per-mesh diffuse color (ARGB)
 std::vector<uint64_t> g_meshTriStart;      // prefix sums of mesh triangle counts
-std::atomic<uint64_t> g_texBytes{0};
-std::atomic<int>      g_texFiles{0};
 std::atomic<float>    g_progress{0.f};     // 0..100
 std::atomic<bool>     g_vertsReady{false};
 std::atomic<bool>     g_allDone{false};
 double g_importMs = 0, g_totalMs = 0;
 
 // ---- materials / textures ----
-struct ViewerTex {                        // decoded diffuse texture
-    int w = 0, h = 0;
-    std::vector<uint32_t> px;             // ARGB, row 0 = image top
-};
 std::vector<ap::PackMaterial> g_materials;       // materials snapshot (string_views stay valid)
-std::vector<ViewerTex> g_texs;                   // decoded diffuse textures
-std::unordered_map<std::string_view, int> g_texByPath;  // mtl path -> g_texs index
-std::vector<int> g_meshTex;                      // per-mesh texture index or -1
+texp::TexPipeline g_texPipe;                     // parallel mmap + stb_image decode
+std::vector<int> g_meshTex;                      // per-mesh texture slot or -1
 std::atomic<bool> g_noTex{false};                // --untex / T: disable textures
-std::atomic<uint64_t> g_texPixels{0};            // decoded pixel count
 
 // ---- scene / camera ----
 float g_scale = 1.f;
@@ -97,28 +104,32 @@ float g_camDist = 2.2f;
 float g_rotY = 0.6f, g_pitch = 0.35f;
 std::atomic<bool> g_quit{false};
 bool g_dragging = false;                   // left-button orbit in progress
-int g_mouseX = 0, g_mouseY = 0;
 float g_offX = 0.f, g_offZ = 0.f;          // WASD view-space offsets
-int g_triBudget = 0;                       // triangles/frame, 0 = draw all (--tris)
-int g_lastStride = 1;
-bool g_cullChecked = false;                // winding probe (set once, first frame)
+float g_offY = 0.f;                        // Q/E world-space camera height
 bool g_cullFrontZ = true;                  // true: CCW front faces have +z winding
 
-// transformed vertex pool for the current frame: 3 floats per vertex
-// (x,y,z in view space); all meshes share one pool (OBJ indices are
-// pool-relative), so the whole pool is transformed once per frame
-std::vector<float> g_tv;
-std::vector<char> g_meshVisible;           // per-mesh frustum cull flag
+// parser pool pointers captured at onVerticesReady (the pack outlives the
+// frame loop, so they stay valid); DxRenderer stages its geometry straight
+// from these pools
+const float* g_posPool = nullptr;
+const float* g_uvPool = nullptr;           // null when the model has no uvs
+const uint32_t* g_idxPool = nullptr;
+size_t g_idxCount = 0;
+size_t g_poolVerts = 0;
 
 // ---- runtime flags ----
 int g_frames = 0;                          // 0 = until quit
-uint64_t g_frameProfile = 0;               // counts frames for the timing log
 bool g_waitAll = false;                    // count frames only after all-done
 int g_shotAt = 0;
 std::string g_shotFile;
 std::string g_modelName;
 uint64_t g_frameCount = 0;
 Clock::time_point g_tLoad;
+
+// ---- DX12 backend state (the implementation lives in DxRenderer) ----
+std::unique_ptr<DxRenderer> g_dx;
+std::string g_dxShotNext;                  // screenshot path, captured next frame
+bool g_forceWarp = false;                  // --warp
 
 // ============================================================
 // utils
@@ -149,401 +160,147 @@ static std::string msStr(double v) {
 }
 
 // ============================================================
-// rasterization: per-thread local buffers, depth-merged on main thread
+// loading overlay (CPU-drawn progress strip, uploaded as a texture)
 // ============================================================
 
-struct ShadeV {                   // one projected vertex
-    float x, y;                   // screen space
-    float z;                      // view space depth (for the z-buffer)
-    float w;                      // 1/z, interpolated perspective-correctly
-    uint32_t c;                   // lit color (0xAARRGGBB)
-    float u, v;                   // texture coordinates (textured meshes)
+// overlay rasterization, run as g_tf tasks (off the render thread):
+
+// ---- TrueType text (Consolas): two baked glyph atlases ---------------
+struct BakedFont {
+    bool ok = false;
+    std::vector<unsigned char> atlas;   // 8-bit alpha
+    int W = 512, H = 256;
+    stbtt_bakedchar chars[96];
 };
+static BakedFont g_fontHud, g_fontBig;
 
-// unlit: vertex color = material diffuse (or texture texel when textured)
-
-static void rasterTri(uint32_t* px, float* zb, int W, int H,
-                      const ShadeV& a, const ShadeV& b, const ShadeV& c,
-                      const ViewerTex* tex) {
-    int lx, hx, ly, hy;
-    if (!obv_normalize_triangle(size_t(W), size_t(H), int(a.x), int(a.y),
-                                int(b.x), int(b.y), int(c.x), int(c.y),
-                                &lx, &hx, &ly, &hy))
+static void initFonts() {
+    const char* candidates[] = {
+        "C:/Windows/Fonts/consola.ttf",   // Consolas: monospace, crisp stats
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    };
+    std::vector<char> data;
+    const char* used = nullptr;
+    for (const char* path : candidates) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) continue;
+        data.assign(std::istreambuf_iterator<char>(f),
+                    std::istreambuf_iterator<char>());
+        if (data.size() > 1000) {
+            used = path;
+            break;
+        }
+    }
+    if (!used) {
+        AP_LOG_WARN("viewer", "no system font found; overlays render without text");
         return;
-    const int x0 = int(a.x), y0 = int(a.y), x1 = int(b.x), y1 = int(b.y),
-              x2 = int(c.x), y2 = int(c.y);
-    for (int y = ly; y <= hy; ++y) {
-        for (int x = lx; x <= hx; ++x) {
-            int u1, u2, det;
-            if (!obv_barycentric(x0, y0, x1, y1, x2, y2, x, y, &u1, &u2, &det))
-                continue;
-            const float l1 = float(u1) / float(det);
-            const float l2 = float(u2) / float(det);
-            const float l0 = 1.f - l1 - l2;
-            const float w = l0 * a.w + l1 * b.w + l2 * c.w;
-            if (w <= 0.f) continue;
-            const float z = 1.f / w;
-            const size_t i = size_t(y) * size_t(W) + size_t(x);
-            if (z >= zb[i]) continue;
-            // perspective-correct attribute blending
-            const float wa = l0 * a.w, wb = l1 * b.w, wc = l2 * c.w;
-            float r = (wa * ((a.c >> 16) & 255) + wb * ((b.c >> 16) & 255)
-                       + wc * ((c.c >> 16) & 255)) / w;
-            float g = (wa * ((a.c >> 8) & 255) + wb * ((b.c >> 8) & 255)
-                       + wc * ((c.c >> 8) & 255)) / w;
-            float bl = (wa * (a.c & 255) + wb * (b.c & 255)
-                        + wc * (c.c & 255)) / w;
-            if (tex) {
-                // sample the diffuse texture and modulate by the light
-                const float u = (wa * a.u + wb * b.u + wc * c.u) / w;
-                const float v = (wa * a.v + wb * b.v + wc * c.v) / w;
-                int tx = int(u * tex->w);
-                int ty = int((1.f - v) * tex->h);
-                if (tx < 0) tx = 0;
-                else if (tx >= tex->w) tx = tex->w - 1;
-                if (ty < 0) ty = 0;
-                else if (ty >= tex->h) ty = tex->h - 1;
-                const uint32_t tcol =
-                    tex->px[size_t(ty) * size_t(tex->w) + size_t(tx)];
-                r *= float((tcol >> 16) & 255) / 255.f;
-                g *= float((tcol >> 8) & 255) / 255.f;
-                bl *= float(tcol & 255) / 255.f;
+    }
+    const auto bake = [&data](BakedFont& f, float px) {
+        f.atlas.assign(size_t(f.W) * f.H, 0);
+        const int r = stbtt_BakeFontBitmap(
+            reinterpret_cast<const unsigned char*>(data.data()), 0, px,
+            f.atlas.data(), f.W, f.H, 32, 96, f.chars);
+        f.ok = r > 0;
+    };
+    bake(g_fontHud, 26.f);
+    bake(g_fontBig, 36.f);
+    AP_LOG("viewer", "font: %s (hud %s, big %s)", used,
+           g_fontHud.ok ? "ok" : "off", g_fontBig.ok ? "ok" : "off");
+}
+
+// alpha-blend baked glyphs onto an ARGB buffer; y = top of the line
+static void drawTextTTF(uint32_t* px, int bufW, int bufH, const BakedFont& f,
+                        const char* s, float x, float y, uint32_t col) {
+    if (!f.ok || !s) return;
+    const uint32_t cr = (col >> 16) & 255, cg = (col >> 8) & 255,
+                   cb = col & 255;
+    float fx = x, fy = y;
+    for (const char* p = s; *p; ++p) {
+        const unsigned char c = (unsigned char)*p;
+        if (c < 32 || c >= 128) continue;
+        stbtt_aligned_quad q;
+        stbtt_GetBakedQuad(f.chars, f.W, f.H, int(c) - 32, &fx, &fy, &q, 1);
+        const int x0 = std::max(0, int(q.x0)), x1 = std::min(bufW, int(q.x1));
+        const int y0 = std::max(0, int(q.y0)), y1 = std::min(bufH, int(q.y1));
+        if (x1 <= x0 || y1 <= y0) continue;
+        const float gw = q.x1 - q.x0, gh = q.y1 - q.y0;
+        for (int yy = y0; yy < y1; ++yy) {
+            const float tv =
+                q.t0 + (q.t1 - q.t0) * (float(yy) - q.y0) / (gh + 0.01f);
+            const unsigned char* arow =
+                f.atlas.data() + size_t(tv * f.H) * f.W;
+            for (int xx = x0; xx < x1; ++xx) {
+                const float tu =
+                    q.s0 + (q.s1 - q.s0) * (float(xx) - q.x0) / (gw + 0.01f);
+                const unsigned char a = arow[int(tu * f.W)];
+                if (!a) continue;
+                uint32_t& dst = px[size_t(yy) * bufW + xx];
+                const uint32_t br = (dst >> 16) & 255, bg = (dst >> 8) & 255,
+                               bb = dst & 255;
+                dst = 0xFF000000u
+                    | ((br + (cr - br) * a / 255) << 16)
+                    | ((bg + (cg - bg) * a / 255) << 8)
+                    | (bb + (cb - bb) * a / 255);
             }
-            px[i] = 0xFF000000u
-                  | (uint32_t(r + 0.5f) << 16)
-                  | (uint32_t(g + 0.5f) << 8)
-                  | uint32_t(bl + 0.5f);
-            zb[i] = z;
         }
     }
 }
 
-// Transform + shade + rasterize the global triangle range [t0, t1) into
-// one thread's local buffers. No shared state, so no races.
-static void rasterRange(uint32_t* px, float* zb, uint64_t t0, uint64_t t1,
-                        int stride) {
-    if (t0 >= t1) return;
-    const float* tv = g_tv.data();
-    constexpr float f = float(kWinH) * 0.5f / 0.5773503f;  // fov 60 deg
-
-    size_t mi = 0;                       // mesh owning t0 (prefix sums)
-    while (mi + 1 < g_meshTriStart.size() && g_meshTriStart[mi + 1] <= t0) ++mi;
-
-    uint64_t t = t0;
-    while (t < t1) {
-        const uint64_t mEnd = g_meshTriStart[mi + 1];
-        if (t >= mEnd) { ++mi; continue; }
-        if (!g_meshVisible[mi]) {          // frustum-culled this frame
-            t = mEnd;
-            ++mi;
-            continue;
-        }
-        const ap::PackMesh& m = g_meshes[mi];
-        const uint32_t mat = g_matColor[mi];
-        const int texIdx = g_meshTex[mi];
-        const ViewerTex* tex =
-            !g_noTex.load() && texIdx >= 0 && !m.texcoords.empty()
-                ? &g_texs[size_t(texIdx)]
-                : nullptr;
-        const float* tc = tex ? m.texcoords.data() : nullptr;
-        const uint32_t* idx = m.indices.data();
-        const uint64_t base = g_meshTriStart[mi];
-        const uint64_t stop = t1 < mEnd ? t1 : mEnd;
-
-        for (; t < stop; t += stride) {
-            const size_t ii = size_t(t - base) * 3;
-            const uint32_t ia = idx[ii], ib = idx[ii + 1], ic = idx[ii + 2];
-            const float* A = tv + size_t(ia) * 3;
-            const float* B = tv + size_t(ib) * 3;
-            const float* C = tv + size_t(ic) * 3;
-            const float ax = A[0], ay = A[1], az = A[2];
-            const float bx = B[0], by = B[1], bz = B[2];
-            const float cx = C[0], cy = C[1], cz = C[2];
-            // backface cull: keep faces whose view-space winding matches the
-            // model's front side (probed once on the first frame)
-            const float fnz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-            if (g_cullFrontZ ? fnz <= 0.f : fnz >= 0.f) continue;
-            const float iax = 1.f / az, ibx = 1.f / bz, icx = 1.f / cz;
-            ShadeV sA, sB, sC;
-            sA.x = float(kWinW) * 0.5f + f * ax * iax;
-            sA.y = float(kWinH) * 0.5f - f * ay * iax;
-            sA.z = az;
-            sA.w = iax;
-            sB.x = float(kWinW) * 0.5f + f * bx * ibx;
-            sB.y = float(kWinH) * 0.5f - f * by * ibx;
-            sB.z = bz;
-            sB.w = ibx;
-            sC.x = float(kWinW) * 0.5f + f * cx * icx;
-            sC.y = float(kWinH) * 0.5f - f * cy * icx;
-            sC.z = cz;
-            sC.w = icx;
-            // sub-pixel triangles: count them, then draw as a 1px point
-            // instead of entering the full rasterizer
-            const float area = 0.5f * std::fabs(
-                (sB.x - sA.x) * (sC.y - sA.y) - (sB.y - sA.y) * (sC.x - sA.x));
-            if (area < 1.f) {
-                const float wsum = (sA.w + sB.w + sC.w) / 3.f;
-                const float pz = 1.f / wsum;
-                const int px_ = int(sA.x + sB.x + sC.x) / 3;
-                const int py_ = int(sA.y + sB.y + sC.y) / 3;
-                if (px_ >= 0 && px_ < kWinW && py_ >= 0 && py_ < kWinH) {
-                    const size_t pi = size_t(py_) * size_t(kWinW) + size_t(px_);
-                    if (pz < zb[pi]) {
-                        uint32_t col = mat;
-                        if (tc) {
-                            const float u = (tc[ia * 2] + tc[ib * 2] +
-                                             tc[ic * 2]) / 3.f;
-                            const float v = (tc[ia * 2 + 1] + tc[ib * 2 + 1] +
-                                             tc[ic * 2 + 1]) / 3.f;
-                            int tx = int(u * tex->w);
-                            int ty = int((1.f - v) * tex->h);
-                            if (tx < 0) tx = 0;
-                            else if (tx >= tex->w) tx = tex->w - 1;
-                            if (ty < 0) ty = 0;
-                            else if (ty >= tex->h) ty = tex->h - 1;
-                            col = tex->px[size_t(ty) * size_t(tex->w) + size_t(tx)];
-                        }
-                        px[pi] = col;
-                        zb[pi] = pz;
-                    }
-                }
-                continue;
-            }
-            sA.c = mat;
-            sB.c = mat;
-            sC.c = mat;
-            if (tc) {
-                sA.u = tc[ia * 2];
-                sA.v = tc[ia * 2 + 1];
-                sB.u = tc[ib * 2];
-                sB.v = tc[ib * 2 + 1];
-                sC.u = tc[ic * 2];
-                sC.v = tc[ic * 2 + 1];
-            }
-            rasterTri(px, zb, kWinW, kWinH, sA, sB, sC, tex);
-        }
-    }
+// plain color rect (the loading bar); no rendering library needed
+static void fillRect(uint32_t* px, int bufW, int bufH,
+                     int x, int y, int w, int h, uint32_t col) {
+    const int x0 = std::max(0, x), y0 = std::max(0, y);
+    const int x1 = std::min(bufW, x + w), y1 = std::min(bufH, y + h);
+    for (int yy = y0; yy < y1; ++yy)
+        for (int xx = x0; xx < x1; ++xx)
+            px[size_t(yy) * bufW + xx] = col;
 }
 
-// ============================================================
-// frame drawing
-// ============================================================
+// 960x80 ARGB text strip -> RGBA bytes, ready for the HUD upload
+static std::vector<unsigned char> rasterHud(const std::string& line1) {
+    std::vector<uint32_t> hud(size_t(kWinW) * 80, kBg);
+    drawTextTTF(hud.data(), kWinW, 80, g_fontHud, line1.c_str(), 14, 6,
+                kText);
+    drawTextTTF(hud.data(), kWinW, 80, g_fontHud, kHudHelp, 14, 44, kText);
+    std::vector<unsigned char> rgba(hud.size() * 4);
+    for (size_t p = 0; p < hud.size(); ++p) {
+        const uint32_t col = hud[p];
+        rgba[4 * p] = unsigned char(col >> 16);
+        rgba[4 * p + 1] = unsigned char(col >> 8);
+        rgba[4 * p + 2] = unsigned char(col);
+        rgba[4 * p + 3] = 255;
+    }
+    return rgba;
+}
 
-static void drawLoading() {
-    std::fill(g_px.begin(), g_px.end(), kBg);
-    const Obv_Canvas c = obv_canvas(g_px.data(), kWinW, kWinH, kWinW);
+// full-window loading frame (ARGB), bar + caption at the given percent
+static std::vector<uint32_t> rasterLoading(int pctI) {
+    std::vector<uint32_t> px(size_t(kWinW) * size_t(kWinH), kBg);
     const int bw = int(kWinW * 0.6f), bh = 12;
     const int bx = (kWinW - bw) / 2, by = kWinH - 130;
-    obv_rect(c, bx, by, bw, bh, kSlot);
-    const float pct = g_progress.load();
+    fillRect(px.data(), kWinW, kWinH, bx, by, bw, bh, kSlot);
+    const float pct = float(pctI);
     if (pct > 0.f)
-        obv_rect(c, bx + 2, by + 2, int((bw - 4) * pct / 100.f), bh - 4, kBar);
-    char txt[192];
-    std::snprintf(txt, sizeof txt, "Loading %s  %.0f%%", g_modelName.c_str(), pct);
-    const int tw = 6 * 2 * int(std::strlen(txt));   // 6px glyph, scale 2
-    obv_text(c, txt, (kWinW - tw) / 2, by - 40, obv_default_font(), 2, kText);
-}
-
-static void drawFrame(double fpsNow) {
-    if (!g_vertsReady.load()) {
-        drawLoading();
-        return;
-    }
-
-    const size_t nVerts = g_tv.size() / 3;
-    const uint64_t nTris = g_meshTriStart.back();
-    const int stride = (g_triBudget > 0 && nTris > uint64_t(g_triBudget))
-                           ? int(nTris / uint64_t(g_triBudget))
-                           : 1;
-    g_lastStride = stride;
-    const auto t0 = Clock::now();
-
-    // 1) rotate/translate the shared vertex pool (parallel)
-    const float cY = std::cos(g_rotY), sY = std::sin(g_rotY);
-    const float cP = std::cos(g_pitch), sP = std::sin(g_pitch);
-    const float s = g_scale, cx = g_center[0], cy = g_center[1], cz = g_center[2];
-    const float dist = g_camDist;
-    const float* src = g_meshes[0].positions.data();
-    std::vector<std::thread> pool;
-    pool.reserve(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
-        const size_t b = nVerts * size_t(t) / kThreads;
-        const size_t e = nVerts * (size_t(t) + 1) / kThreads;
-        pool.emplace_back([=]() {
-            for (size_t i = b; i < e; ++i) {
-                const float px = (src[3 * i] - cx) * s;
-                const float py = (src[3 * i + 1] - cy) * s;
-                const float pz = (src[3 * i + 2] - cz) * s;
-                const float x1 = cY * px + sY * pz;
-                const float z1 = -sY * px + cY * pz;
-                float* d = g_tv.data() + 3 * i;
-                d[0] = x1 + g_offX;
-                d[1] = cP * py - sP * z1;
-                d[2] = sP * py + cP * z1 + dist + g_offZ;
-            }
-        });
-    }
-    for (auto& th : pool) th.join();
-    const auto tXform = Clock::now();
-
-    // per-mesh frustum cull via the bounding-sphere test (conservative:
-    // any point of the sphere projects within cxs +/- span of its center
-    // projection, so meshes crossing the near plane or the screen edge
-    // are never dropped)
-    {
-        constexpr float nearPlane = 0.05f;
-        const float f = float(kWinH) * 0.5f / 0.5773503f;
-        for (size_t mi = 0; mi < g_meshes.size(); ++mi) {
-            const ap::PackMesh& m = g_meshes[mi];
-            const float dx = m.boundsMax[0] - m.boundsMin[0];
-            const float dy = m.boundsMax[1] - m.boundsMin[1];
-            const float dz = m.boundsMax[2] - m.boundsMin[2];
-            const float r = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz) * s;
-            const float mx = (m.boundsMin[0] + m.boundsMax[0]) * 0.5f;
-            const float my = (m.boundsMin[1] + m.boundsMax[1]) * 0.5f;
-            const float mz = (m.boundsMin[2] + m.boundsMax[2]) * 0.5f;
-            const float px = (mx - cx) * s, py = (my - cy) * s,
-                        pz = (mz - cz) * s;
-            const float x1 = cY * px + sY * pz;
-            const float z1 = -sY * px + cY * pz;
-            const float vx = x1 + g_offX;
-            const float vy = cP * py - sP * z1;
-            const float vz = sP * py + cP * z1 + dist + g_offZ;
-            if (vz - r < nearPlane) {
-                g_meshVisible[mi] = 1;   // sphere crosses the near plane
-                continue;
-            }
-            const float cxs = f * vx / vz, cys = f * vy / vz;
-            const float span = f * r / (vz - r);
-            g_meshVisible[mi] = !(cxs + span < 0 || cxs - span > kWinW ||
-                                  cys + span < 0 || cys - span > kWinH);
+        fillRect(px.data(), kWinW, kWinH, bx + 2, by + 2,
+                 int((bw - 4) * pct / 100.f), bh - 4, kBar);
+    if (g_fontBig.ok) {
+        char txt[192];
+        std::snprintf(txt, sizeof txt, "Loading %s  %.0f%%",
+                      g_modelName.c_str(), pct);
+        // center the caption by walking the advances once
+        float wq = 0.f, yq = 0.f;
+        for (const char* p = txt; *p; ++p) {
+            const unsigned char ch = (unsigned char)*p;
+            if (ch < 32 || ch >= 128) continue;
+            stbtt_aligned_quad q;
+            stbtt_GetBakedQuad(g_fontBig.chars, g_fontBig.W, g_fontBig.H,
+                               int(ch) - 32, &wq, &yq, &q, 1);
         }
+        drawTextTTF(px.data(), kWinW, kWinH, g_fontBig, txt,
+                    float((kWinW - int(wq)) / 2), float(by - 56), kText);
     }
-
-    // winding probe: models may be CW or CCW; sample the first triangles
-    // in view space once and cull the back side accordingly
-    if (!g_cullChecked) {
-        int pos = 0, neg = 0;
-        uint64_t s = 0;
-        for (size_t mi = 0; mi < g_meshes.size() && s < 4096; ++mi) {
-            const ap::PackMesh& m = g_meshes[mi];
-            const uint32_t* idx = m.indices.data();
-            const uint64_t n = std::min<uint64_t>(m.triangleCount(), 4096 - s);
-            for (uint64_t t = 0; t < n; ++t) {
-                const float* A = g_tv.data() + size_t(idx[3 * t]) * 3;
-                const float* B = g_tv.data() + size_t(idx[3 * t + 1]) * 3;
-                const float* C = g_tv.data() + size_t(idx[3 * t + 2]) * 3;
-                const float fnz = (B[0] - A[0]) * (C[1] - A[1])
-                                - (B[1] - A[1]) * (C[0] - A[0]);
-                fnz > 0.f ? ++pos : ++neg;
-            }
-            s += n;
-        }
-        g_cullFrontZ = pos >= neg;
-        g_cullChecked = true;
-        AP_LOG("viewer", "winding probe: %d ccw %d cw -> front=%s", pos, neg,
-               g_cullFrontZ ? "+z" : "-z");
-    }
-
-    // 2) clear per-thread buffers and raster triangle ranges (parallel)
-    for (int t = 0; t < kThreads; ++t) {
-        const uint64_t b = nTris * uint64_t(t) / uint64_t(kThreads);
-        const uint64_t e = nTris * (uint64_t(t) + 1) / uint64_t(kThreads);
-        pool[size_t(t)] = std::thread([t, b, e, stride]() {
-            std::fill(g_tpx[t].begin(), g_tpx[t].end(), kBg);
-            std::fill(g_tzb[t].begin(), g_tzb[t].end(), INFINITY);
-            rasterRange(g_tpx[t].data(), g_tzb[t].data(), b, e, stride);
-        });
-    }
-    for (auto& th : pool) th.join();
-    const auto tRaster = Clock::now();
-
-    // 3) merge the depth-sorted thread buffers (parallel over pixel ranges;
-    // each thread owns disjoint pixels, so no shared state)
-    {
-        std::vector<std::thread> mpool;
-        mpool.reserve(kThreads);
-        for (int t = 0; t < kThreads; ++t) {
-            const size_t b = g_px.size() * size_t(t) / kThreads;
-            const size_t e = g_px.size() * (size_t(t) + 1) / kThreads;
-            mpool.emplace_back([b, e]() {
-                for (size_t i = b; i < e; ++i) {
-                    float best = g_tzb[0][i];
-                    int bi = 0;
-                    for (int t = 1; t < kThreads; ++t)
-                        if (g_tzb[t][i] < best) { best = g_tzb[t][i]; bi = t; }
-                    g_px[i] = g_tpx[bi][i];
-                }
-            });
-        }
-        for (auto& th : mpool) th.join();
-    }
-    const auto tMerge = Clock::now();
-
-    // stage timing profile (every 60th frame)
-    ++g_frameProfile;
-    if (g_frameProfile % 60 == 0) {
-        const auto msf = [](Clock::time_point a, Clock::time_point b) {
-            return std::chrono::duration<double, std::milli>(b - a).count();
-        };
-        AP_LOG("viewer", "frame profile: xform %.2f ms | raster %.2f ms | "
-                         "merge %.2f ms | total %.2f ms",
-               msf(t0, tXform), msf(tXform, tRaster), msf(tRaster, tMerge),
-               msf(t0, tMerge));
-    }
-
-    // 4) HUD
-    const Obv_Canvas c = obv_canvas(g_px.data(), kWinW, kWinH, kWinW);
-    char info[256];
-    std::snprintf(info, sizeof info,
-                  "%s | %llu tris | drawing %llu (x%d) | %.1f fps | Esc quit",
-                  g_modelName.c_str(), (unsigned long long)nTris,
-                  (unsigned long long)(nTris / uint64_t(stride)), stride,
-                  fpsNow);
-    obv_text(c, info, 10, 10, obv_default_font(), 2, kText);
-    obv_text(c, "drag: orbit   wheel: zoom   WASD: move   T: textures", 10, 30,
-             obv_default_font(), 2, kText);
-}
-
-// ============================================================
-// screenshot (24-bit BMP, bottom-up)
-// ============================================================
-
-static void saveBmp(const std::string& path) {
-    const int rowBytes = (kWinW * 3 + 3) & ~3;
-    const uint32_t imgBytes = uint32_t(rowBytes) * uint32_t(kWinH);
-    std::vector<uint8_t> out(54 + imgBytes);
-    auto put16 = [&](size_t o, uint16_t v) {
-        out[o] = uint8_t(v);
-        out[o + 1] = uint8_t(v >> 8);
-    };
-    auto put32 = [&](size_t o, uint32_t v) {
-        out[o] = uint8_t(v);
-        out[o + 1] = uint8_t(v >> 8);
-        out[o + 2] = uint8_t(v >> 16);
-        out[o + 3] = uint8_t(v >> 24);
-    };
-    put16(0, 0x4D42);
-    put32(2, 54 + imgBytes);
-    put32(10, 54);
-    put32(14, 40);
-    put32(18, uint32_t(kWinW));
-    put32(22, uint32_t(kWinH));
-    put16(26, 1);
-    put16(28, 24);
-    put32(34, imgBytes);
-    for (int y = 0; y < kWinH; ++y) {
-        const uint32_t* row = g_px.data() + size_t(kWinH - 1 - y) * kWinW;
-        uint8_t* dst = out.data() + 54 + size_t(y) * rowBytes;
-        for (int x = 0; x < kWinW; ++x) {
-            dst[3 * x] = uint8_t(row[x]);          // B
-            dst[3 * x + 1] = uint8_t(row[x] >> 8); // G
-            dst[3 * x + 2] = uint8_t(row[x] >> 16);// R
-        }
-    }
-    std::ofstream f(path, std::ios::binary);
-    f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
-    AP_LOG("viewer", "saved %s", path.c_str());
+    return px;
 }
 
 // ============================================================
@@ -558,7 +315,7 @@ static void bindTextures() {
         g_meshTex.assign(g_meshTex.size(), -1);
         return;
     }
-    if (g_materials.empty() || g_meshTex.empty() || g_texByPath.empty()) return;
+    if (g_materials.empty() || g_meshTex.empty() || g_texPipe.count() == 0) return;
     g_meshTex.assign(g_meshTex.size(), -1);
     size_t nMat = 0, nNoDiff = 0, nLookupFail = 0, nNoUV = 0;
     uint64_t trisNoDiff = 0, trisBound = 0;
@@ -574,9 +331,9 @@ static void bindTextures() {
         bool found = false;
         for (const ap::PackTexRef& ref : m.textures) {
             if (ref.type != int(ap::TexType::TexDiffuse)) continue;
-            const auto it = g_texByPath.find(ref.path);
-            if (it != g_texByPath.end()) {
-                g_meshTex[i] = it->second;
+            const int slot = g_texPipe.slotFor(ref.path);
+            if (slot >= 0) {
+                g_meshTex[i] = slot;
                 found = true;
                 if (g_meshes[i].texcoords.empty()) ++nNoUV;
                 break;
@@ -600,6 +357,10 @@ static void bindEvents(ap::AssetPack& pack) {
     pack.setOnVerticesReady(
         [](ap::PackResult& r, std::span<const ap::PackMesh> meshes) {
             g_meshes.assign(meshes.begin(), meshes.end());
+            // the copies above may hold stale pre-bind temp material
+            // indices; refresh them from the live result before binding
+            for (size_t i = 0; i < g_meshes.size() && i < r.meshes.size(); ++i)
+                g_meshes[i].materialIndex = r.meshes[i].materialIndex;
             float mn[3] = {INFINITY, INFINITY, INFINITY};
             float mx[3] = {-INFINITY, -INFINITY, -INFINITY};
             for (const ap::PackMesh& m : g_meshes)
@@ -619,8 +380,11 @@ static void bindEvents(ap::AssetPack& pack) {
             g_matColor.assign(g_meshes.size(), kColor0);
             g_meshTex.assign(g_meshes.size(), -1);
             const size_t poolVerts = r.positions.size() / 3;
-            g_tv.resize(poolVerts * 3);
-            g_meshVisible.assign(g_meshes.size(), 1);
+            g_posPool = r.positions.data();
+            g_uvPool = r.texcoords.empty() ? nullptr : r.texcoords.data();
+            g_idxPool = r.posIndices.data();
+            g_idxCount = r.posIndices.size();
+            g_poolVerts = poolVerts;
             const uint64_t nTris = g_meshTriStart.back();
             AP_LOG("viewer", "vertices ready: %zu meshes, %zu verts, %llu tris",
                    g_meshes.size(), poolVerts, (unsigned long long)nTris);
@@ -630,6 +394,48 @@ static void bindEvents(ap::AssetPack& pack) {
                         + msStr(double(r.verticesMicros) / 1000.0)
                         + " ms | verts " + std::to_string(poolVerts)
                         + " tris " + std::to_string(nTris) + " |");
+            // winding probe: models may be CW or CCW; sample triangles in
+            // view space with the initial camera once, here on the parser
+            // thread (same math as the vertex shader), and pick the front
+            // side for the rasterizer state
+            {
+                const float cY = std::cos(g_rotY), sY = std::sin(g_rotY);
+                const float cP = std::cos(g_pitch), sP = std::sin(g_pitch);
+                const float s = g_scale, cx = g_center[0], cy = g_center[1],
+                            cz = g_center[2];
+                const float dist = g_camDist, offX = g_offX, offZ = g_offZ;
+                const float* pool = r.positions.data();
+                int pos = 0, neg = 0;
+                uint64_t cnt = 0;
+                for (const ap::PackMesh& m : g_meshes) {
+                    const uint32_t* idx = m.indices.data();
+                    const uint64_t lim =
+                        std::min<uint64_t>(m.triangleCount(), 4096 - cnt);
+                    for (uint64_t t = 0; t < lim; ++t) {
+                        float V[3][3];
+                        for (int k = 0; k < 3; ++k) {
+                            const float* p = pool + size_t(idx[3 * t + k]) * 3;
+                            const float px = (p[0] - cx) * s,
+                                        py = (p[1] - cy) * s,
+                                        pz = (p[2] - cz) * s;
+                            const float x1 = cY * px + sY * pz;
+                            const float z1 = -sY * px + cY * pz;
+                            V[k][0] = x1 + offX;
+                            V[k][1] = cP * py - sP * z1;
+                            V[k][2] = sP * py + cP * z1 + dist + offZ;
+                        }
+                        const float fnz =
+                            (V[1][0] - V[0][0]) * (V[2][1] - V[0][1])
+                            - (V[1][1] - V[0][1]) * (V[2][0] - V[0][0]);
+                        fnz > 0.f ? ++pos : ++neg;
+                    }
+                    cnt += lim;
+                    if (cnt >= 4096) break;
+                }
+                g_cullFrontZ = pos >= neg;
+                AP_LOG("viewer", "winding probe: %d ccw %d cw -> front=%s",
+                       pos, neg, g_cullFrontZ ? "+z" : "-z");
+            }
             bindTextures();
             g_vertsReady.store(true);
         });
@@ -637,6 +443,10 @@ static void bindEvents(ap::AssetPack& pack) {
     pack.setOnMaterialsReady(
         [](ap::PackResult& r, std::span<const ap::PackMaterial> mats) {
             g_materials.assign(mats.begin(), mats.end());
+            // refresh stale pre-bind indices from the live result before
+            // the diffuse lookup below uses them
+            for (size_t i = 0; i < g_meshes.size() && i < r.meshes.size(); ++i)
+                g_meshes[i].materialIndex = r.meshes[i].materialIndex;
             for (size_t i = 0; i < g_meshes.size(); ++i) {
                 const int mi = g_meshes[i].materialIndex;
                 if (mi < 0 || size_t(mi) >= mats.size()) continue;
@@ -656,76 +466,20 @@ static void bindEvents(ap::AssetPack& pack) {
 
     pack.setOnTexturesReady(
         [](ap::PackResult& r, std::span<const ap::PackTexture> texs) {
-            // parallel mmap + decode of the diffuse textures (stb_image)
-            int ndiff = 0;
-            for (const ap::PackTexture& t : texs)
-                if (!t.embedded && !t.resolvedPath.empty() &&
-                    t.type == int(ap::TexType::TexDiffuse))
-                    ++ndiff;
-            g_texs.clear();
-            g_texs.resize(size_t(ndiff));
-            g_texByPath.clear();
-            g_texPixels = 0;
-            std::vector<int> slotByPos(texs.size(), -1);
-            std::atomic<size_t> next{0};
-            std::atomic<int> slot{0};
-            const unsigned n = std::max(1u, std::thread::hardware_concurrency());
-            std::vector<std::thread> pool;
-            pool.reserve(n);
-            for (unsigned i = 0; i < n; ++i)
-                pool.emplace_back([&]() {
-                    for (;;) {
-                        const size_t k = next.fetch_add(1);
-                        if (k >= texs.size()) break;
-                        const ap::PackTexture& t = texs[k];
-                        if (t.embedded || t.resolvedPath.empty()) continue;
-                        auto mf = ap::MappedFile::openShared(t.resolvedPath);
-                        if (!mf) continue;
-                        g_texBytes += mf->size();
-                        ++g_texFiles;
-                        if (t.type != int(ap::TexType::TexDiffuse)) continue;
-                        int w = 0, h = 0, ch = 0;
-                        unsigned char* rgba = stbi_load_from_memory(
-                            reinterpret_cast<const unsigned char*>(
-                                mf->bytes().data()),
-                            int(mf->size()), &w, &h, &ch, 4);
-                        if (!rgba) {
-                            AP_LOG_WARN("viewer", "decode failed: %.*s",
-                                        int(t.path.size()), t.path.data());
-                            continue;
-                        }
-                        ViewerTex vt;
-                        vt.w = w;
-                        vt.h = h;
-                        vt.px.resize(size_t(w) * size_t(h));
-                        for (size_t p = 0; p < vt.px.size(); ++p) {
-                            const unsigned char* s = rgba + p * 4;
-                            vt.px[p] = 0xFF000000u
-                                     | (uint32_t(s[0]) << 16)
-                                     | (uint32_t(s[1]) << 8)
-                                     | uint32_t(s[2]);
-                        }
-                        stbi_image_free(rgba);
-                        const int si = slot.fetch_add(1);
-                        slotByPos[k] = si;
-                        g_texs[size_t(si)] = std::move(vt);
-                        g_texPixels += size_t(w) * size_t(h);
-                    }
-                });
-            for (auto& th : pool) th.join();
-            for (size_t k = 0; k < texs.size(); ++k)
-                if (slotByPos[k] >= 0)
-                    g_texByPath.emplace(texs[k].path, slotByPos[k]);
+            // blocking parallel mmap + stb_image decode of every external
+            // reference (the shared TexPipeline does the thread pool)
+            g_texPipe.decodeAll(texs);
             AP_LOG("viewer",
-                   "textures ready: %zu refs, %d mmap'd (%.1f MB), %d decoded (%llu px)",
-                   texs.size(), g_texFiles.load(),
-                   double(g_texBytes.load()) / 1048576.0, ndiff,
-                   (unsigned long long)g_texPixels.load());
+                   "textures ready: %zu refs, %d mmap'd (%.1f MB), %zu decoded (%llu px)",
+                   texs.size(), g_texPipe.filesMapped,
+                   double(g_texPipe.bytesMapped) / 1048576.0, g_texPipe.count(),
+                   (unsigned long long)g_texPipe.pixels);
             benchAppend("| " + timestamp() + " | [async] textures-ready | "
                         + msStr(double(r.texturesMicros) / 1000.0)
-                        + " ms | files " + std::to_string(g_texFiles.load())
-                        + ", " + msStr(double(g_texBytes.load()) / 1048576.0)
-                        + " MB, " + std::to_string(ndiff) + " decoded |");
+                        + " ms | files " + std::to_string(g_texPipe.filesMapped)
+                        + ", " + msStr(double(g_texPipe.bytesMapped) / 1048576.0)
+                        + " MB, " + std::to_string(g_texPipe.count())
+                        + " decoded |");
             bindTextures();
         });
 
@@ -763,14 +517,11 @@ static void benchRenderLine(uint64_t frames, double fps) {
     std::ofstream out("benchmark.md", std::ios::app);
     if (tail.find("## render") == std::string::npos) out << "\n" << header;
     const double ms = frames > 0 ? 1000.0 / fps : 0.0;
-    const std::string budget =
-        g_triBudget <= 0 ? "ALL" : std::to_string(g_triBudget);
     char line[256];
     std::snprintf(line, sizeof line,
-                  "| %s | %s | %llu | %.1f | %.1f | %s | %d |\n",
+                  "| %s | %s | %llu | %.1f | %.1f | ALL | 1 |\n",
                   timestamp().c_str(), g_modelName.c_str(),
-                  (unsigned long long)frames, fps, ms, budget.c_str(),
-                  g_lastStride);
+                  (unsigned long long)frames, fps, ms);
     out << line;
 }
 
@@ -785,8 +536,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--frames" && i + 1 < argc) g_frames = std::atoi(argv[++i]);
-        else if (a == "--tris" && i + 1 < argc) g_triBudget = std::atoi(argv[++i]);
         else if (a == "--wait") g_waitAll = true;
+        else if (a == "--warp") g_forceWarp = true;
         else if (a == "--untex") g_noTex = true;
         else if (a == "--shot" && i + 2 < argc) {
             g_shotAt = std::atoi(argv[i + 1]);
@@ -813,15 +564,14 @@ int main(int argc, char** argv) {
         SDL_Quit();
         return 1;
     }
-    g_renderer = SDL_CreateRenderer(g_win, -1, 0);
-    g_screenTex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
-                                    SDL_TEXTUREACCESS_STREAMING, kWinW, kWinH);
-    g_px.resize(size_t(kWinW) * size_t(kWinH));
-    for (int t = 0; t < kThreads; ++t) {
-        g_tpx[t].resize(size_t(kWinW) * size_t(kWinH));
-        g_tzb[t].resize(size_t(kWinW) * size_t(kWinH));
+    g_dx = std::make_unique<DxRenderer>();
+    if (!g_dx->init(g_win, kWinW, kWinH, g_forceWarp)) {
+        std::fprintf(stderr, "DX12 init failed\n");
+        return 1;
     }
 
+
+    initFonts();   // bake Consolas before the first overlay raster task
     AP_LOG("viewer", "window ready, loading %s async", model.c_str());
     g_tLoad = Clock::now();
     {
@@ -832,6 +582,7 @@ int main(int argc, char** argv) {
         std::optional<Clock::time_point> tAll;
         uint64_t framesAll = 0;
         double fpsNow = 0;
+        size_t texReleasedUpTo = 0;   // decoded slots freed after GPU upload
         while (!g_quit.load()) {
             SDL_Event e;
             while (SDL_PollEvent(&e)) {
@@ -846,22 +597,11 @@ int main(int argc, char** argv) {
                                g_noTex.load() ? "OFF" : "ON");
                         break;
                     }
-                    case SDLK_UP:   // raise the budget; 0 = draw all
-                        g_triBudget = g_triBudget <= 0
-                                          ? 100000
-                                          : std::min(g_triBudget * 2, 4000000);
-                        break;
-                    case SDLK_DOWN:
-                        g_triBudget = std::max(g_triBudget / 2, 0);
-                        break;
                     default: break;
                     }
                 } else if (e.type == SDL_MOUSEBUTTONDOWN) {
-                    if (e.button.button == SDL_BUTTON_LEFT) {
+                    if (e.button.button == SDL_BUTTON_LEFT)
                         g_dragging = true;
-                        g_mouseX = e.button.x;
-                        g_mouseY = e.button.y;
-                    }
                 } else if (e.type == SDL_MOUSEBUTTONUP) {
                     if (e.button.button == SDL_BUTTON_LEFT)
                         g_dragging = false;
@@ -879,19 +619,128 @@ int main(int argc, char** argv) {
                 }
             }
             // WASD: move along the view axis (W/S) and strafe (A/D);
-            // the step scales with the current zoom distance
+            // Q/E: raise/lower the camera in world space; the step scales
+            // with the current zoom distance (halved for finer control)
             const Uint8* ks = SDL_GetKeyboardState(nullptr);
-            const float step = 0.02f * g_camDist;
+            const float step = 0.01f * g_camDist;
             if (ks[SDL_SCANCODE_W]) g_offZ -= step;
             if (ks[SDL_SCANCODE_S]) g_offZ += step;
             if (ks[SDL_SCANCODE_A]) g_offX += step;
             if (ks[SDL_SCANCODE_D]) g_offX -= step;
+            if (ks[SDL_SCANCODE_Q]) g_offY -= step;
+            if (ks[SDL_SCANCODE_E]) g_offY += step;
 
-            drawFrame(fpsNow);
-            SDL_UpdateTexture(g_screenTex, nullptr, g_px.data(), kWinW * 4);
-            SDL_RenderClear(g_renderer);
-            SDL_RenderCopy(g_renderer, g_screenTex, nullptr, nullptr);
-            SDL_RenderPresent(g_renderer);
+            // stage the parser pools once (idempotent) as soon as they
+            // exist. With the corrected +y-up NDC the view-space CCW
+            // front side stays CCW on screen; the old negated Y scale
+            // mirrored winding, so this flag flipped with it
+            if (g_vertsReady.load() && g_posPool && !g_dx->geometryReady())
+                g_dx->setGeometry(g_posPool, g_poolVerts, g_uvPool, g_idxPool,
+                                  g_idxCount, g_cullFrontZ);
+            if (!g_vertsReady.load() || !g_dx->geometryReady()) {
+                // loading overlay: rasterize off-thread on progress
+                // changes, consume the latest completed frame
+                const int pct = int(g_progress.load());
+                if (pct != g_loadPct && !g_loadBusy.exchange(true)) {
+                    g_loadPct = pct;
+                    g_tf.async([pct]() {
+                        auto px = std::make_shared<std::vector<uint32_t>>(
+                            rasterLoading(pct));
+                        {
+                            const std::lock_guard<std::mutex> lk(g_ovlMx);
+                            g_loadLatest = std::move(px);
+                        }
+                        g_loadBusy.store(false);
+                    });
+                }
+                std::shared_ptr<std::vector<uint32_t>> load;
+                {
+                    const std::lock_guard<std::mutex> lk(g_ovlMx);
+                    load = std::move(g_loadLatest);
+                }
+                g_dx->drawLoading(load ? load->data() : nullptr);
+            } else {
+                // camera constants: identical math to the software
+                // transform this viewer used to have (the vertex shader
+                // mirrors the layout)
+                const float cY = std::cos(g_rotY), sY = std::sin(g_rotY);
+                const float cP = std::cos(g_pitch), sP = std::sin(g_pitch);
+                const float f = float(kWinH) * 0.5f / 0.5773503f;
+                constexpr float nearPlane = 0.05f, farPlane = 60.f;
+                const float zA = farPlane / (farPlane - nearPlane);
+                const float zB = -nearPlane * farPlane / (farPlane - nearPlane);
+                // NDC y is UP in D3D (unlike the software path's top-left
+                // pixel rows), so the vertical scale is positive - the
+                // old negative sign mirrored the whole scene vertically.
+                // g_offY folds into the center's y: (p.y - (cy + h))*s
+                // shifts the world down by h, i.e. raises the camera
+                const float cam[16] = {
+                    cY, sY, cP, sP,
+                    g_scale, g_center[0], g_center[1] + g_offY, g_center[2],
+                    g_camDist, g_offX, g_offZ, f,
+                    2.f * f / float(kWinW), 2.f * f / float(kWinH), zA, zB,
+                };
+
+                // one draw item per mesh: an index range into the pool IBO
+                std::vector<DxRenderer::DrawItem> items;
+                items.reserve(g_meshes.size());
+                const bool texOn = !g_noTex.load();
+                for (size_t i = 0; i < g_meshes.size(); ++i) {
+                    const ap::PackMesh& m = g_meshes[i];
+                    if (m.indices.empty()) continue;
+                    DxRenderer::DrawItem it;
+                    it.indexCount = uint32_t(m.indices.size());
+                    it.startIndex = uint32_t(g_meshTriStart[i] * 3);
+                    it.color = g_matColor[i];
+                    it.texSlot = texOn && g_meshTex[i] >= 0 ? g_meshTex[i] : -1;
+                    items.push_back(it);
+                }
+
+                // HUD: text into a 960x80 strip, rasterized on the
+                // taskflow when the text changes; the render thread only
+                // consumes completed results (dropping stale ones)
+                char info[256];
+                std::snprintf(info, sizeof info,
+                              "%s | %llu tris | %.1f fps | DX12 | Esc quit",
+                              g_modelName.c_str(),
+                              (unsigned long long)g_meshTriStart.back(), fpsNow);
+                const std::string hudText(info);
+                if (hudText != g_hudSubmitted && !g_hudBusy.exchange(true)) {
+                    g_hudSubmitted = hudText;
+                    g_tf.async([t = hudText]() {
+                        auto rgba = std::make_shared<std::vector<unsigned char>>(
+                            rasterHud(t));
+                        {
+                            const std::lock_guard<std::mutex> lk(g_ovlMx);
+                            g_hudLatest = std::move(rgba);
+                        }
+                        g_hudBusy.store(false);
+                    });
+                }
+                std::shared_ptr<std::vector<unsigned char>> hud;
+                {
+                    const std::lock_guard<std::mutex> lk(g_ovlMx);
+                    hud = std::move(g_hudLatest);
+                }
+
+                // drawScene consumes g_dxShotNext; the frame after the shot
+                // request is captured (content is identical: static camera
+                // between frames)
+                g_dx->drawScene(cam, items, g_texPipe.data(), g_texPipe.count(),
+                                32, hud ? hud->data() : nullptr,
+                                g_dxShotNext.empty() ? nullptr
+                                                     : g_dxShotNext.c_str());
+                g_dxShotNext.clear();
+                // ResourceUploadBatch::End copies the sources into its
+                // staging buffers synchronously, so once the frame is
+                // submitted the decoded pixels this frame uploaded are
+                // dead weight - hand them back immediately
+                const size_t upNow = g_dx->texturesUploaded();
+                if (upNow > texReleasedUpTo) {
+                    g_texPipe.releaseSlots(texReleasedUpTo, upNow);
+                    texReleasedUpTo = upNow;
+                }
+            }
             ++g_frameCount;
 
             if (g_allDone.load()) {
@@ -901,7 +750,7 @@ int main(int argc, char** argv) {
             }
             const uint64_t limit = g_waitAll ? framesAll : g_frameCount;
             if (g_shotAt > 0 && limit == uint64_t(g_shotAt))
-                saveBmp(g_shotFile);
+                g_dxShotNext = g_shotFile;   // captured next frame
             if (g_frames > 0 && (!g_waitAll || g_allDone.load()) &&
                 limit >= uint64_t(g_frames))
                 break;
@@ -911,8 +760,7 @@ int main(int argc, char** argv) {
                (unsigned long long)framesAll, fpsNow);
     }
 
-    SDL_DestroyTexture(g_screenTex);
-    SDL_DestroyRenderer(g_renderer);
+    g_dx.reset();
     SDL_DestroyWindow(g_win);
     SDL_Quit();
     AP_LOG("viewer", "bye");

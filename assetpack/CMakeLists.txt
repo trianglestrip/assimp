@@ -37,34 +37,37 @@ if(MSVC)
     target_compile_options(pack_demo PRIVATE /utf-8)
 endif()
 
-# ---- viewer: 渐进式模型查看器（olive.c 软件渲染 + SDL2 窗口）----
+# ---- viewer: 渐进式模型查看器（Direct3D 12 + DirectXTK12，SDL2 窗口）----
 # 编译后直接运行 assetpack_viewer 即打开窗口并加载默认模型（San Miguel）。
-set(ASSETPACK_WITH_VIEWER ON CACHE BOOL "Build the olive.c software-renderer viewer demo")
+# 源码拆分：viewer_demo.cpp 主循环 + TexPipeline 并行解码 + DxRenderer D3D12 后端。
+set(ASSETPACK_WITH_VIEWER ON CACHE BOOL "Build the Direct3D 12 viewer demo")
 if(ASSETPACK_WITH_VIEWER)
-    set(OLIVEC_ROOT "F:/project/third_party/olive.c" CACHE PATH "olive.c single-header renderer root")
     set(SDL2_ROOT "F:/project/third_party/SDL2-2.32.10" CACHE PATH "SDL2 dev package root")
-    if(NOT EXISTS "${OLIVEC_ROOT}/olive.c")
-        message(FATAL_ERROR "ASSETPACK_WITH_VIEWER=ON but olive.c not found at OLIVEC_ROOT=${OLIVEC_ROOT}")
-    endif()
     if(NOT EXISTS "${SDL2_ROOT}/include/SDL2/SDL.h" OR NOT EXISTS "${SDL2_ROOT}/lib/x64/SDL2.lib")
         message(FATAL_ERROR "ASSETPACK_WITH_VIEWER=ON but SDL2 not found at SDL2_ROOT=${SDL2_ROOT}")
     endif()
 
-    # olive.c 需要 C99（字体表用 designated initializer），C++ 侧通过桥调用
-    add_library(olive_bridge STATIC examples/olive_bridge.c)
-    target_include_directories(olive_bridge PRIVATE ${OLIVEC_ROOT})
-    if(MSVC)
-        target_compile_options(olive_bridge PRIVATE /std:c11)
-    endif()
-
-    add_executable(assetpack_viewer examples/viewer_demo.cpp)
+    add_executable(assetpack_viewer examples/viewer_demo.cpp
+                             examples/TexPipeline.cpp
+                             examples/DxRenderer.cpp)
     target_include_directories(assetpack_viewer PRIVATE
-        ${OLIVEC_ROOT} ${SDL2_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-    target_link_libraries(assetpack_viewer PRIVATE assetpack olive_bridge
-        "${SDL2_ROOT}/lib/x64/SDL2.lib" "${SDL2_ROOT}/lib/x64/SDL2main.lib")
+        ${SDL2_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+    # DirectX Tool Kit for DX12: device/sprite/texture-upload plumbing
+    set(BUILD_XAUDIO_WIN10 OFF CACHE BOOL "" FORCE)
+    set(BUILD_XAUDIO_REDIST OFF CACHE BOOL "" FORCE)
+    set(BUILD_GAMEINPUT OFF CACHE BOOL "" FORCE)
+    set(BUILD_WGI OFF CACHE BOOL "" FORCE)
+    set(BUILD_XINPUT OFF CACHE BOOL "" FORCE)
+    set(BUILD_DXIL_SHADERS OFF CACHE BOOL "" FORCE)   # this machine has fxc, not dxc
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/DirectXTK12
+                     ${CMAKE_CURRENT_BINARY_DIR}/DirectXTK12)
+    target_link_libraries(assetpack_viewer PRIVATE assetpack DirectXTK12
+        "${SDL2_ROOT}/lib/x64/SDL2.lib" "${SDL2_ROOT}/lib/x64/SDL2main.lib"
+        d3d12 dxgi d3dcompiler)
     target_compile_definitions(assetpack_viewer PRIVATE SDL_MAIN_HANDLED NOMINMAX)
     if(MSVC)
-        target_compile_options(assetpack_viewer PRIVATE /utf-8)
+        target_compile_options(assetpack_viewer PRIVATE /utf-8 /Zi)
+        target_link_options(assetpack_viewer PRIVATE /DEBUG)
     endif()
     add_custom_command(TARGET assetpack_viewer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

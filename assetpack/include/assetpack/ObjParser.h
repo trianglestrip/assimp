@@ -37,6 +37,11 @@ public:
     explicit ObjParser(unsigned threads = 0);
     ~ObjParser() override;
 
+    // Opt-out for consumers that never use normals (the viewer): skips
+    // the vn pool parse, the per-vertex normal expansion arrays and the
+    // expanded output. Default true (behavior unchanged).
+    void setWantNormals(bool want) override { wantNormals_ = want; }
+
     bool load(std::string_view path) override;
     void loadAsync(std::string_view path) override;
     PackResult& result() override;
@@ -49,6 +54,7 @@ private:
     std::shared_ptr<void> flow_;      // tf::Taskflow, type-erased
     std::shared_ptr<PackResult> result_;
     std::string lastError_;
+    bool wantNormals_ = true;
 };
 
 } // namespace ap

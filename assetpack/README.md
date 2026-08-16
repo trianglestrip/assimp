@@ -50,8 +50,9 @@ cmake --build build --config Release
 build\Release\pack_demo.exe F:\project\meshToBrowser\models\San_Miguel\san-miguel.obj
 ```
 
-San Miguel（1.14GB OBJ）实测：5.93M 顶点 / 9.98M 三角形 / 2203 meshes /
-287 材质 / 323 贴图引用，几何解析约 0.6s（assimp 版为 14s+）。
+San Miguel（1.14GB OBJ）实测：5.93M 位置顶点 / 9.98M 三角形 / 2203 meshes /
+287 材质 / 323 贴图引用。几何解析（含纹理接缝顶点分裂：5.93M → 9.02M
+输出顶点，保证镜像/接缝 uv 正确）热缓存约 1.9s（assimp 版为 14s+）。
 每次运行把各阶段耗时追加到 benchmark.md。
 
 ## 查看器（assetpack_viewer）
@@ -67,29 +68,36 @@ build\Release\assetpack_viewer.exe model.obj      # 指定模型
 build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
 ```
 
-- 16 线程软件光栅化（olive.c 渲染 API + 自写透视 z-buffer：线程局部
-  缓冲 + 主线程深度合成），模型顶点池每帧并行变换一次；首帧自动
-  探测模型 winding 并做背面剔除。
-- 默认绘制全部三角形（San Miguel 全画约 21fps）；`--tris N` 限制每帧
-  预算（超出时按 stride 均匀采样），窗口内 Up/Down 实时增减预算
-  （Down 到底 = 全画）。
-- 性能：每帧 3 项并行 —— 顶点池变换（3 floats/顶点）、16 线程
-  光栅化（mesh 级外接球视锥剔除 + 亚像素三角形降为 1px 点）、
-  16 线程深度合成。960x720 全画 San Miguel 约 21fps
-  （优化前约 11fps：剔除 + 精简顶点池 + 并行合成）。
+- 仅原生 Direct3D 12 GPU 渲染:场景由查看器自定义 PSO 绘制,
+  HUD/加载画面和 GPU 上传使用微软 DirectXTK12 的 `SpriteBatch` /
+  `ResourceUploadBatch` / `GraphicsMemory`;`--warp` 选择 WARP 软件设备。
+- 源码按职责拆分:`viewer_demo.cpp` 主循环 + 事件绑定,
+  `TexPipeline` 在解析线程并行 mmap + stb_image 解码贴图(保留
+  RGBA 字节直接上传,无换色往返),`DxRenderer` 拥有设备/交换链/
+  帧调度;解析与显示共用 taskflow:解析侧 chunk 并行 + 接缝分裂,
+  显示侧 HUD/加载条在独立 `tf::Executor` 上异步光栅化(最新完成
+  交接,渲染线程零等待)。帧调度为双缓冲在飞(按帧 fence 等待,
+  不再全量等 GPU 空闲)、几何零拷贝上传(positions/texcoords/索引
+  池原样进 VBO/IBO)、贴图分帧上传并即用即释。
+- mmap + taskflow 的自定义 OBJ/MTL 解析器和 stb_image 贴图解码,
+  不依赖 assimp;法线默认解析(`setWantNormals(false)` 可选跳过)。
+- 贴图上传后用 DirectXTK12 `GenerateMips` 在 GPU 生成完整 mip 链,
+  采样器 point + mip 线性(近处保持锐利 texel,远处按 mip 混合),
+  San Miguel 全画约 38 fps(无 mip 时 16 fps)。
 - 鼠标交互：左键拖拽旋转视角、滚轮缩放（距离 0.15..10，可贴近
   模型表面）；无自动旋转，WASD 沿视线前进/后退 + 左右平移
   （步长随缩放距离缩放）。
 - `--untex` 禁用贴图绑定（与贴图版对比查看）。
 - 光照：无光（unlit）直出 —— 顶点色 = 材质 diffuse，纹理路径直接显示
   贴图像素原色（贴图自带烘焙光照），不做光照计算。
-- 贴图：onTexturesReady 时按 `TexDiffuse` 引用并行 mmap + stb_image
-  解码（San Miguel：323 引用 / 143 MB / 264 张解码 ≈ 9160 万像素），
-  透视校正插值 uv，纹理色与光照 shade 相乘；无贴图的网格回落纯色。
+- 贴图：onTexturesReady 时 TexPipeline 按 `TexDiffuse` 引用并行 mmap +
+  stb_image 解码（San Miguel：323 引用 / 143 MB / 264 张解码 ≈ 9160 万
+  像素），GPU 采样纹理色 × 材质色；无贴图的网格回落纯色。
 - `--frames N` 渲染 N 帧退出（`--wait` 时从解析完成开始计）、
   `--shot N file.bmp` 第 N 帧截图、Esc 退出。
-- 渲染性能与预算追加到 benchmark.md 的 `## render` 小节。
+- 渲染性能追加到 benchmark.md 的 `## render` 小节。
 
-依赖（可选，`ASSETPACK_WITH_VIEWER` 默认 ON）：olive.c 单文件渲染库、
-SDL2 开发包、stb_image（已随仓库提供 third_party/stb）；
-路径用 `-DOLIVEC_ROOT=... -DSDL2_ROOT=...` 配置。
+依赖（可选，`ASSETPACK_WITH_VIEWER` 默认 ON）：SDL2 开发包、
+stb_image / stb_truetype（已随仓库提供 third_party/stb，界面文字用
+系统 Consolas 烘焙）、DirectXTK12（已随仓库提供 external/DirectXTK12）；
+路径用 `-DSDL2_ROOT=...` 配置。

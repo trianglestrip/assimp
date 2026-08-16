@@ -1,6 +1,8 @@
 #include "assetpack/ObjParser.h"
 #include "assetpack/Log.h"
 
+#include "FastParse.h"   // fast number kernels (from_chars fallback inside)
+
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -43,16 +45,15 @@ inline const char* nextToken(const char* p, const char* end,
     return p;
 }
 
+// OBJ numbers overwhelmingly match the fast kernels' shapes; anything
+// unusual (exotic exponents, 19+ digits, malformed) falls back to
+// std::from_chars inside FastParse.h, preserving the old semantics
 inline float parseFloat(const char* s, size_t n) {
-    float v = 0.f;
-    std::from_chars(s, s + n, v);
-    return v;
+    return ap::fast::parseFloat(s, n);
 }
 
 inline int64_t parseInt(const char* s, size_t n) {
-    int64_t v = 0;
-    std::from_chars(s, s + n, v);
-    return v;
+    return ap::fast::parseInt(s, n);
 }
 
 enum class LineKind { Other, V, VN, VT, F, UseMtl, Object, Group, Mtllib };
@@ -89,12 +90,69 @@ inline LineKind classify(const char* p, const char* end) {
     }
 }
 
-// number of vertex tokens on an 'f' line (tokens starting with digit/'-')
+// number of vertex tokens on an 'f' line (tokens starting with digit/'-'),
+// scanned 8 bytes per iteration (SWAR). Each word is turned into per-byte
+// flag masks (flag = top bit 0x80 of each byte): sepHigh marks separators
+// (' ' / '\t' / '\r'), startHigh marks the first byte of each maximal
+// non-space run (non-sep byte whose predecessor was a separator; the run
+// state carried across word boundaries is prevSep, initialized true so a
+// token starting at p itself counts). A run start is counted when its byte
+// is an ASCII digit or '-'. All per-byte additions stay <= 0xFE, so no
+// carries bleed between lanes and every mask is exact per byte; bytes with
+// the high bit set are never digits (matching the old signed-char tests).
 inline uint32_t countFaceVerts(const char* p, const char* end) {
+    constexpr uint64_t kOnes  = 0x0101010101010101ull; // 0x01 per byte
+    constexpr uint64_t kHighs = 0x8080808080808080ull; // 0x80 per byte
+    constexpr uint64_t kLow7  = 0x7F7F7F7F7F7F7F7Full; // 0x7F per byte
+    const uint64_t kSp    = uint64_t(' ') * kOnes;
+    const uint64_t kTab   = uint64_t('\t') * kOnes;
+    const uint64_t kCr    = uint64_t('\r') * kOnes;
+    const uint64_t kMinus = uint64_t('-') * kOnes;
+
+    // exact per-byte equality: 0x80 flag in every byte of w equal to c
+    auto eqHigh = [&](uint64_t w, uint64_t c) {
+        const uint64_t t = w ^ c;
+        return ~(((t & kLow7) + kLow7) | t) & kHighs;
+    };
+
     uint32_t n = 0;
-    const char* tok; size_t len;
-    while ((p = nextToken(p, end, tok, len)) != nullptr)
-        if ((tok[0] >= '0' && tok[0] <= '9') || tok[0] == '-') ++n;
+    bool prevByteNonSep = false; // byte before p: none, so acts as separator
+    while (end - p >= 8) {
+        uint64_t w;
+        std::memcpy(&w, p, sizeof w); // unaligned-safe load; p+8 <= end
+        const uint64_t sepHigh = eqHigh(w, kSp) | eqHigh(w, kTab) | eqHigh(w, kCr);
+        // digit-or-'-': 7-bit range test for 0x30..0x39 (b + 0x50 flags
+        // b >= 0x30, b + 0x46 flags b >= 0x3A) plus exact '-' equality;
+        // & ~w stops high-bit bytes from aliasing onto the digit range
+        const uint64_t b7 = w & kLow7;
+        const uint64_t dmHigh = (((b7 + 0x50 * kOnes) & ~(b7 + 0x46 * kOnes) & ~w & kHighs)
+                                 | eqHigh(w, kMinus));
+        const uint64_t nonSepHigh = ~sepHigh & kHighs;
+        // token START: a non-sep byte whose PREDECESSOR is a separator.
+        // Within a word the predecessor flag comes from << 8 (byte k-1);
+        // byte 0's predecessor is the previous word's last byte. (The
+        // shift direction matters: >> 8 would mark run ENDS, which
+        // silently inflated the triangle counts.)
+        uint64_t prevHigh = nonSepHigh << 8;
+        if (prevByteNonSep) prevHigh |= 0x80ull;   // block byte 0 start
+        const uint64_t startHigh = nonSepHigh & ~prevHigh;
+        prevByteNonSep = (nonSepHigh >> 56) != 0;  // this word's last byte
+        // one 0x80 hit bit per counted byte: >> 3 makes lanes 0x10, the
+        // multiply by kOnes sums them into the top byte carry-free, and
+        // >> 60 extracts the count (<= 8 per word)
+        n += uint32_t((((startHigh & dmHigh) >> 3) * kOnes) >> 60);
+        p += 8;
+    }
+    for (; p < end; ++p) { // tail: fewer than 8 bytes, byte-at-a-time
+        const unsigned char c = (unsigned char)*p;
+        const bool sep = (c == ' ' || c == '\t' || c == '\r');
+        if (!sep) {
+            if (!prevByteNonSep && ((c - '0') <= 9u || c == '-')) ++n;
+            prevByteNonSep = true;
+        } else {
+            prevByteNonSep = false;
+        }
+    }
     return n;
 }
 
@@ -104,6 +162,75 @@ inline uint32_t countFaceVerts(const char* p, const char* end) {
 inline int32_t resolveIndex(int64_t raw, size_t base, size_t running) {
     if (raw > 0) return int32_t(raw - 1);
     return int32_t(int64_t(base + running) + raw);
+}
+
+// ---- texture-seam splitting ------------------------------------------------
+// An OBJ "vertex" is really the (v, vt, vn) triplet. One position can be
+// referenced with different vt/vn combos (texture seams, mirrored uvs,
+// atlases); collapsing those onto the position with an arbitrary winner
+// maps the wrong uv region onto some faces. Pass 2 claims each
+// per-position slot with the FIRST (v, vt, vn) combo and splits every
+// conflicting combo into its own output vertex.
+struct SeamVert {
+    uint32_t v, vt, vn;   // pool indices; 0xFFFFFFFF = part absent
+};
+// Open-addressing map for seam lookups: the sharded unordered_map made
+// ~3M heap node allocations under a lock per load (the dominant cost of
+// pass2 after seam splitting landed); a flat power-of-two table with
+// linear probing keeps every operation allocation-free and cache-local.
+// Key = (v, vt, vn) split across two lanes (68 bits won't fit one u64).
+struct SeamShard {
+    std::mutex mx;
+    std::vector<uint64_t> keys0;   // vt | (vn << 32)
+    std::vector<uint32_t> keys1;   // v
+    std::vector<uint32_t> vals;    // output vertex; 0xFFFFFFFF = empty
+    std::vector<std::pair<uint32_t, SeamVert>> added;   // data for seamFill
+    size_t mask = 0;
+    size_t count = 0;
+
+    void seed(size_t slots) {
+        size_t s = 1024;
+        while (s < slots) s <<= 1;
+        keys0.assign(s, 0);
+        keys1.assign(s, 0);
+        vals.assign(s, 0xFFFFFFFFu);
+        mask = s - 1;
+        count = 0;
+    }
+    size_t probe(uint32_t v, uint64_t k0) const {
+        size_t i = size_t((k0 ^ (uint64_t(v) * 0x9E3779B97F4A7C15ull))
+                          >> 20) & mask;
+        while (vals[i] != 0xFFFFFFFFu
+               && !(keys1[i] == v && keys0[i] == k0))
+            i = (i + 1) & mask;
+        return i;
+    }
+    void grow() {   // caller holds mx
+        std::vector<uint64_t> o0 = std::move(keys0);
+        std::vector<uint32_t> o1 = std::move(keys1);
+        std::vector<uint32_t> ov = std::move(vals);
+        seed((mask + 1) * 2);
+        for (size_t i = 0; i < ov.size(); ++i) {
+            if (ov[i] == 0xFFFFFFFFu) continue;
+            const size_t j = probe(o1[i], o0[i]);
+            keys0[j] = o0[i];
+            keys1[j] = o1[i];
+            vals[j] = ov[i];
+            ++count;
+        }
+    }
+};
+
+// first writer claims the slot; a different value already there = seam
+inline bool claimIdx(uint32_t& slot, uint32_t val) {
+    std::atomic_ref<uint32_t> a(slot);
+    uint32_t cur = a.load(std::memory_order_relaxed);
+    for (;;) {
+        if (cur == val) return true;
+        if (cur != 0xFFFFFFFFu) return false;
+        if (a.compare_exchange_weak(cur, val, std::memory_order_relaxed))
+            return true;
+    }
 }
 
 // Parse one 'f' line; invoke fn(v, vt, vn) per vertex with resolved
@@ -256,6 +383,10 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
     // reference one vertex from different chunks; the last writer wins)
     auto vnIdx = std::make_shared<std::vector<uint32_t>>();
     auto uvIdx = std::make_shared<std::vector<uint32_t>>();
+    // seam-split state: sharded (v, vt, vn) -> output-vertex table
+    auto shards = std::make_shared<std::array<SeamShard, 16>>();
+    auto seamCounter = std::make_shared<std::atomic<uint32_t>>(0);
+    auto baseVerts = std::make_shared<size_t>(0);
 
     // ---- stage 1: mmap obj + quick mtllib head-scan ----
     tf::Task mapTask = tf.emplace([this, result, pathStr]() {
@@ -304,10 +435,13 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
     });
 
     // ---- stage 2a: geometry (chunk-parallel two-pass + expand) ----
-    tf::Task geometryTask = tf.emplace([this, result, groups, mtlNames, vnPool, uvPool, vnIdx, uvIdx](tf::Subflow& sf) {
+    tf::Task geometryTask = tf.emplace([this, result, groups, mtlNames, vnPool, uvPool, vnIdx, uvIdx, shards, seamCounter, baseVerts](tf::Subflow& sf) {
         if (!result->objFile) return;
         const auto tStart = Clock::now();
         AP_LOG("geometry", "begin");
+        // local copy for the subflow lambdas (read once, before any task)
+        const bool wantN = wantNormals_;
+        if (!wantN) AP_LOG("geometry", "normals skipped (wantNormals=false)");
         const std::string_view text = result->objFile->text();
         const char* data = text.data();
         const size_t size = text.size();
@@ -351,7 +485,9 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
         });
 
         // prefix sums + flat-array allocation (serial, tiny)
-        tf::Task prefix = sf.emplace([chunks, result, vnPool, uvPool, vnIdx, uvIdx, nChunks]() {
+        tf::Task prefix = sf.emplace([chunks, result, vnPool, uvPool, vnIdx, uvIdx, nChunks, wantN, baseVerts, shards, tStart]() {
+            AP_LOG("geometry", "pass1 done at %llu us",
+                   static_cast<unsigned long long>(microsSince(tStart)));
             size_t p = 0, n = 0, u = 0, t = 0;
             for (int i = 0; i < nChunks; ++i) {
                 ChunkInfo& c = (*chunks)[size_t(i)];
@@ -360,15 +496,24 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
             }
             result->positions.resize(p * 3);
             result->posIndices.resize(t * 3);
-            vnPool->resize(n * 3);
+            if (wantN) vnPool->resize(n * 3);
             uvPool->resize(u * 2);
             // per-vertex vn/vt reference slots; 0xFFFFFFFF marks "no
-            // reference yet" so unreferenced vertices keep zero normals
-            vnIdx->assign(p, 0xFFFFFFFFu);
+            // reference yet" so unreferenced vertices keep zero normals.
+            // vnIdx stays empty when normals are not wanted; pass 2's
+            // store and pass 3's expansion both turn off on that.
+            if (wantN) vnIdx->assign(p, 0xFFFFFFFFu);
             uvIdx->assign(p, 0xFFFFFFFFu);
             // expansion targets (per-vertex indexed, filled by pass 3)
-            if (n) result->normals.assign(p * 3, 0.f);
+            if (wantN && n) result->normals.assign(p * 3, 0.f);
             if (u) result->texcoords.assign(p * 2, 0.f);
+            *baseVerts = p;   // seam splits append past this in seamFill
+            // seed the seam shards (they grow themselves on load): San
+            // Miguel splits half its positions, so start generous
+            for (SeamShard& sh : *shards) {
+                sh.seed(1u << 17);
+                sh.added.reserve(1u << 17);
+            }
             AP_LOG("geometry", "pass1: %zu v / %zu vn / %zu vt / %zu tris",
                    p, n, u, t);
         });
@@ -376,7 +521,8 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
         // pass 2 (parallel): fill arrays; fan-triangulate faces and
         // resolve 1-based / negative-relative indices per chunk
         tf::Task pass2 = sf.for_each_index(0, nChunks, 1,
-            [chunks, result, vnPool, uvPool, vnIdx, uvIdx, data](int ci) {
+            [chunks, result, vnPool, uvPool, vnIdx, uvIdx, data, wantN,
+             shards, seamCounter, baseVerts](int ci) {
                 ChunkInfo& c = (*chunks)[size_t(ci)];
                 const char* p = data + c.begin;
                 const char* end = data + c.end;
@@ -400,10 +546,18 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
                         }
                         ++lp;
                     } else if (k == LineKind::VN) {
-                        q = p + 2;
-                        for (int comp = 0; comp < 3; ++comp) {
-                            if (!(q = nextToken(q, eol, tok, len))) break;
-                            nrm[ln * 3 + comp] = parseFloat(tok, len);
+                        // the counter advances even when the floats are
+                        // skipped: chunk prefix bases and negative-index
+                        // resolution depend on vn counts regardless. The
+                        // per-vertex vnIdx store below is disabled by its
+                        // !vnIdx->empty() guard (vnIdx is left empty when
+                        // !wantN) -- do not weaken that guard.
+                        if (wantN) {
+                            q = p + 2;
+                            for (int comp = 0; comp < 3; ++comp) {
+                                if (!(q = nextToken(q, eol, tok, len))) break;
+                                nrm[ln * 3 + comp] = parseFloat(tok, len);
+                            }
                         }
                         ++ln;
                     } else if (k == LineKind::VT) {
@@ -424,23 +578,56 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
                             [&](int32_t v, int32_t vt, int32_t vn) {
                                 if (v < 0) return;
                                 const uint32_t ip = uint32_t(v);
-                                if (fv == 0) ip0 = ip;
-                                else if (fv >= 2) {
-                                    *pi++ = ip0; *pi++ = prevIp; *pi++ = ip;
+                                const uint32_t vtU =
+                                    vt >= 0 ? uint32_t(vt) : 0xFFFFFFFFu;
+                                const uint32_t vnU =
+                                    vn >= 0 ? uint32_t(vn) : 0xFFFFFFFFu;
+                                // first (vt, vn) combo claims the position
+                                // slot; a conflicting combo is a texture
+                                // seam and splits into its own vertex
+                                bool uniq = true;
+                                if (vtU != 0xFFFFFFFFu && !uvIdx->empty()
+                                    && !claimIdx((*uvIdx)[ip], vtU))
+                                    uniq = false;
+                                if (uniq && vnU != 0xFFFFFFFFu
+                                    && !vnIdx->empty()
+                                    && !claimIdx((*vnIdx)[ip], vnU))
+                                    uniq = false;
+                                uint32_t out = ip;
+                                if (!uniq) {
+                                    const SeamVert sv{ip, vtU, vnU};
+                                    const uint64_t k0 =
+                                        uint64_t(vtU)
+                                        | (uint64_t(vnU) << 32);
+                                    SeamShard& sh = (*shards)[size_t(
+                                        (k0 ^ (uint64_t(ip)
+                                               * 0x9E3779B97F4A7C15ull))
+                                        >> 20) & 15];
+                                    std::lock_guard<std::mutex> lk(sh.mx);
+                                    size_t i = sh.probe(ip, k0);
+                                    if (sh.vals[i] != 0xFFFFFFFFu) {
+                                        out = sh.vals[i];
+                                    } else {
+                                        if ((sh.count + 1) * 4
+                                            >= (sh.mask + 1) * 3) {
+                                            sh.grow();
+                                            i = sh.probe(ip, k0);
+                                        }
+                                        out = uint32_t(*baseVerts
+                                                       + seamCounter->fetch_add(1));
+                                        sh.keys0[i] = k0;
+                                        sh.keys1[i] = ip;
+                                        sh.vals[i] = out;
+                                        ++sh.count;
+                                        sh.added.emplace_back(out, sv);
+                                    }
                                 }
-                                prevIp = ip;
+                                if (fv == 0) ip0 = out;
+                                else if (fv >= 2) {
+                                    *pi++ = ip0; *pi++ = prevIp; *pi++ = out;
+                                }
+                                prevIp = out;
                                 ++fv;
-                                // remember the vn/vt reference for the
-                                // per-vertex expansion (pass 3). Several
-                                // chunks may reference the same vertex, so
-                                // the slots are written atomically (x86:
-                                // plain movs) and any writer wins.
-                                if (vn >= 0 && !vnIdx->empty())
-                                    std::atomic_ref<uint32_t>((*vnIdx)[ip]).store(
-                                        uint32_t(vn), std::memory_order_relaxed);
-                                if (vt >= 0 && !uvIdx->empty())
-                                    std::atomic_ref<uint32_t>((*uvIdx)[ip]).store(
-                                        uint32_t(vt), std::memory_order_relaxed);
                             });
                     }
                     p = eol + 1;
@@ -454,29 +641,54 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
         // vertex range and copies, so every slot has exactly one writer
         // (no cross-chunk races). Vertices no face references keep
         // their zero default (viewer falls back to face normals).
-        tf::Task pass3 = sf.for_each_index(0, int(result->positions.size() / 3), 1,
-            [result, vnIdx, uvIdx, vnPool, uvPool](int i) {
-                const size_t iv = size_t(i);
-                const float* vn = vnPool->data();
-                const float* uv = uvPool->data();
-                if (!result->normals.empty()) {
-                    const uint32_t in = std::atomic_ref<const uint32_t>(
-                        (*vnIdx)[iv]).load(std::memory_order_relaxed);
-                    if (in != 0xFFFFFFFFu) {
-                        const size_t in3 = size_t(in) * 3;
-                        float* dst = result->normals.data() + iv * 3;
-                        dst[0] = vn[in3]; dst[1] = vn[in3 + 1]; dst[2] = vn[in3 + 2];
-                    }
-                }
-                if (!result->texcoords.empty()) {
-                    const uint32_t iu = std::atomic_ref<const uint32_t>(
-                        (*uvIdx)[iv]).load(std::memory_order_relaxed);
-                    if (iu != 0xFFFFFFFFu) {
-                        const size_t iu2 = size_t(iu) * 2;
-                        float* dst = result->texcoords.data() + iv * 2;
-                        dst[0] = uv[iu2]; dst[1] = uv[iu2 + 1];
-                    }
-                }
+        // The loop range depends on positions, which the prefix task
+        // resizes only after this subflow is built - the range must be
+        // evaluated when this task RUNS, not when the graph is declared
+        // (the old form captured an empty range and silently skipped
+        // the whole pass, leaving every texcoord/normal zero).
+        tf::Task pass3 = sf.emplace(
+            [result, vnIdx, uvIdx, vnPool, uvPool, tStart,
+             baseVerts](tf::Subflow& inner) {
+                // base slots only: seam splits were filled directly by
+                // seamFill, and vnIdx/uvIdx stop at the base count
+                const int nVerts = int(*baseVerts);
+                if (nVerts <= 0) return;
+                const auto t3 = Clock::now();
+                inner.for_each_index(0, nVerts, 1,
+                    [result, vnIdx, uvIdx, vnPool, uvPool](int i) {
+                        const size_t iv = size_t(i);
+                        const float* vn = vnPool->data();
+                        const float* uv = uvPool->data();
+                        if (!result->normals.empty()) {
+                            const uint32_t in =
+                                std::atomic_ref<const uint32_t>((*vnIdx)[iv])
+                                    .load(std::memory_order_relaxed);
+                            if (in != 0xFFFFFFFFu) {
+                                const size_t in3 = size_t(in) * 3;
+                                float* dst = result->normals.data() + iv * 3;
+                                dst[0] = vn[in3];
+                                dst[1] = vn[in3 + 1];
+                                dst[2] = vn[in3 + 2];
+                            }
+                        }
+                        if (!result->texcoords.empty()) {
+                            const uint32_t iu =
+                                std::atomic_ref<const uint32_t>((*uvIdx)[iv])
+                                    .load(std::memory_order_relaxed);
+                            if (iu != 0xFFFFFFFFu) {
+                                const size_t iu2 = size_t(iu) * 2;
+                                float* dst = result->texcoords.data() + iv * 2;
+                                dst[0] = uv[iu2];
+                                dst[1] = uv[iu2 + 1];
+                            }
+                        }
+                    });
+                inner.join();
+                AP_LOG("geometry", "pass3 gather: %llu us over %d verts",
+                       static_cast<unsigned long long>(
+                           std::chrono::duration_cast<std::chrono::microseconds>(
+                               Clock::now() - t3).count()),
+                       nVerts);
             });
 
         // build groups from ordered markers; then pack PackMesh views
@@ -587,9 +799,72 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
                    result->meshes.size());
         });
 
+        // seam resolve: grow the pools by the split vertices and fill
+        // their data (position copy from the base slot + their own
+        // uv/normal straight from the vn/vt pools). Runs once, after all
+        // pass2 chunks finish, so every split index is final here.
+        tf::Task seamFill = sf.emplace([result, vnPool, uvPool, shards,
+                                        seamCounter,
+                                        baseVerts](tf::Subflow& inner) {
+            const size_t base = *baseVerts;
+            const size_t n = seamCounter->load();
+            if (!n) return;
+            result->positions.resize((base + n) * 3);
+            if (!result->normals.empty())
+                result->normals.resize((base + n) * 3);
+            if (!result->texcoords.empty())
+                result->texcoords.resize((base + n) * 2);
+            // flatten the shard lists (cheap pointer gather), then fill
+            // in parallel: entries write disjoint output slots
+            std::vector<const std::pair<uint32_t, SeamVert>*> entries;
+            size_t total = 0;
+            for (const SeamShard& sh : *shards) total += sh.added.size();
+            entries.reserve(total);
+            for (const SeamShard& sh : *shards)
+                for (const auto& e : sh.added) entries.push_back(&e);
+            float* pos = result->positions.data();
+            float* nrm = result->normals.data();
+            float* uv = result->texcoords.data();
+            const float* np = vnPool->data();
+            const float* up = uvPool->data();
+            const bool wantNrm = !result->normals.empty();
+            const bool wantUv = !result->texcoords.empty();
+            inner.for_each_index(0, int(total), 1, [&](int i) {
+                const auto& [idx, sv] = *entries[size_t(i)];
+                // dst is always past base, src below it: no overlap
+                const size_t d = size_t(idx) * 3, s = size_t(sv.v) * 3;
+                pos[d] = pos[s];
+                pos[d + 1] = pos[s + 1];
+                pos[d + 2] = pos[s + 2];
+                if (wantNrm && sv.vn != 0xFFFFFFFFu) {
+                    float* dn = nrm + d;
+                    const float* sn = np + size_t(sv.vn) * 3;
+                    dn[0] = sn[0]; dn[1] = sn[1]; dn[2] = sn[2];
+                }
+                if (wantUv && sv.vt != 0xFFFFFFFFu) {
+                    float* dt = uv + size_t(idx) * 2;
+                    const float* st = up + size_t(sv.vt) * 2;
+                    dt[0] = st[0]; dt[1] = st[1];
+                }
+            });
+            inner.join();
+            AP_LOG("geometry", "seam split: %zu extra vertices (%zu -> %zu)",
+                   n, base, base + n);
+        });
+
+        // per-stage timing: prefix runs right after pass1 completes, the
+        // stamp task right after pass2, and the pass3 wrapper times its
+        // own gather - so one load logs where the geometry time goes
+        tf::Task stamp2 = sf.emplace([tStart]() {
+            AP_LOG("geometry", "pass2 done at %llu us",
+                   static_cast<unsigned long long>(microsSince(tStart)));
+        });
+
         pass1.precede(prefix);
         prefix.precede(pass2);
-        pass2.precede(pass3);
+        pass2.precede(seamFill, stamp2);   // stamp2 is a side branch: it
+                                           // logs without blocking pass3
+        seamFill.precede(pass3);
         pass3.precede(build);
         sf.join();
     });

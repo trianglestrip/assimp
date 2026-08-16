@@ -155,6 +155,11 @@ public:
 
     virtual PackResult& result() = 0;
 
+    // Attribute opt-out for consumers that never read a section (the
+    // viewer uses positions/texcoords only). Parsers without the
+    // section, or that cannot skip it, ignore the call.
+    virtual void setWantNormals(bool want) { (void)want; }
+
 protected:
     // subclasses call these when a stage completes
     void fireVertices(PackResult& r, std::span<const PackMesh> m) const {

@@ -50,6 +50,9 @@ public:
     void setOnAllDone(AllDone cb)               { parser_->setOnAllDone(std::move(cb)); }
     void setProgress(Progress cb)               { parser_->setProgress(std::move(cb)); }
 
+    // Parser attribute opt-outs (ignored by parsers without the section)
+    void setWantNormals(bool want)              { parser_->setWantNormals(want); }
+
     // Blocking load; events fire before returning.
     bool load(std::string_view path)       { return parser_->load(path); }
     // Async load; events fire on the parser's executor threads.
