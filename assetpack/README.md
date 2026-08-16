@@ -180,6 +180,34 @@ GPU 最差帧仅 5.2 ms（占 16.7 ms 帧预算 31%），两个视角几乎无�
 11.7 ms）、record 恒定 ~3.1 ms，即尖峰来自 DWM 合成器节拍抖动，
 与场景负载无关。
 
+**超大模型测试**（把瓶颈真正打到 GPU 上）：
+
+| 模型 | 三角形 | 解析耗时 | GPU avg | GPU 1%low | 帧率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| San Miguel | 10.4M | 1010 ms | 3.7 ms | 5.1 ms | 60 fps（锁） |
+| Powerplant | 12.7M | 340 ms | 4.4 ms | 5.0 ms | 60 fps（锁） |
+| Powerplant ×9（平铺） | 114.8M | 11.2 s（冷）/ 5.6 s（热） | **20.2 ms** | **21.3 ms** | **23.7 fps** |
+
+- Powerplant（`casual-effects.com` 波音 777 工厂，818 MB OBJ，66
+  材质无贴图）是 McGuire 仓库最大模型，暴露了解析器一个真 bug：
+  **OBJ 负索引（相对索引）在非首 chunk 解析错误**——`resolveIndex`
+  把 chunk 前缀基数和运行计数重复相加，负索引全部解析错、面被
+  丢弃、残留垃圾索引在包围盒阶段越界崩溃（San Miguel 全正索引
+  所以一直没暴露）。修复后 12.7M tris 解析 340 ms。
+- **114.8M tris（`powerplant_x9.obj`，8.5 GB，Powerplant 3×3 平铺）
+  首次让 GPU 成为真瓶颈**：scene 20.2 ms 超过 16.7 ms 帧预算，
+  帧率从锁定的 60 fps 掉到 23.7 fps，GPU 1% low 21.3 ms。光栅化
+  负载由屏幕覆盖像素 ×MSAA 决定（12.7M 与 10.4M 同级 ~4 ms），
+  只有三角形量上亿后 GPU 才饱和。CPU 录制反而降到 0.74 ms
+  （平铺后 513 draws < San Miguel 2203）。
+- 解析超线性（9× 数据 → 冷 33×/热 16× 耗时）：8.5 GB mmap +
+  2.5 GB 池在 16 GB 内存机上页缓存驻留不足 + 内存带宽饱和，
+  非算法退化（12.7M 时 340 ms 内联近线性）。
+- 复现：`assetpack_viewer --wait --frames 300 --autoRotate --stat x9
+  F:/project/meshToBrowser/models/powerplant_x9.obj`；平铺生成脚本
+  `models/tile_powerplant.py`（step1 负索引转绝对、step2 网格复制
+  加偏移，9 份 = 114.8M tris）。
+
 ## PIX 分析（程序化抓帧 + 命令行导出）
 
 viewer 集成了 WinPixEventRuntime（vendored 到 `third_party/pix`，
