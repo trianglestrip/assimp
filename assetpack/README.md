@@ -162,3 +162,39 @@ depth prepass（过绘制场景的 PS 减负，双倍 draw 数）。60 fps 之�
 追加一条 `## compare` 行（行=版本，列=指标，同项对比），并把每帧
 cpu/gpu/scene/ovl/wait/record 写入 `stat/<标签>.csv`；浏览器打开
 `tools/stat_plot.html` 多选 CSV 即可叠加折线对比不同优化版本。
+
+## PIX 分析（程序化抓帧 + 命令行导出）
+
+viewer 集成了 WinPixEventRuntime（vendored 到 `third_party/pix`，
+`USE_PIX=1` 编译宏激活真实 API），支持程序化 GPU 抓帧：
+
+```
+assetpack_viewer --pix cap.wpix [--pixStart N] model.obj
+```
+
+- `--pix`：从第 N 帧（默认第 0 帧）开始 PIXBeginCapture，帧循环结束
+  PIXEndCapture 保存 .wpix。**必须传 `--pixStart` 跳过纹理上传密集段**：
+  PIX 的高频计数器窗口只有抓帧开始后 ~100ms，若从第一帧抓，HFC 窗口
+  全落在上传上，看不到稳态渲染。
+- 要求机器装有 PIX（winget `Microsoft.PIX`）；程序启动时
+  loadPixGpuCapturer() 在 D3D12 设备创建前加载 WinPixGpuCapturer.dll
+  （PIX 不捕获已存在的设备）。
+- DxRenderer 在 drawScene/endFrame 打了 PIXScopedEvent 时间线标记
+  （texture uploads / scene draws / msaa resolve / imgui overlay /
+  present），PIX GUI 里可按段查看每段 GPU 耗时。
+
+命令行导出（需 Windows 开发者模式）：
+
+```
+pixtool open-capture cap.wpix save-high-frequency-counters hfc.csv
+pixtool open-capture cap.wpix save-event-list events.csv
+```
+
+**San Miguel 稳态实测结论**（`build/Release/pix/ANALYSIS.md`，图表
+`hfc_steady_chart.png`）：PIX HFC 的 `GPU Activity` / `3D/Compute
+Engine Activity` 计数器在本机（虚拟显示适配器环境）恒报 99-100%，
+与 nvidia-smi（30%）和自研 timestamp query（~4ms/帧）矛盾，不可信；
+但吞吐类计数器（VS 3.6% / PS 0.4% / Rasterizer 4.4% / SM 4.0%）可信，
+与"GPU 大部分空闲、瓶颈在 CPU 录制"的结论吻合。PIX 的每事件 GPU
+耗时只能看 GUI 时间线；pixtool 的 timing capture 只能抓不能读回。
+

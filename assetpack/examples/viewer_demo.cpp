@@ -8,7 +8,7 @@
 //
 // Usage:  assetpack_viewer [model.obj] [--frames N] [--wait]
 //                          [--shot N file.bmp] [--untex] [--warp]
-//                          [--stat name] [--pix file.wpix]
+//                          [--stat name] [--pix file.wpix [--pixStart N]]
 // With no model argument the default scene (San Miguel) is loaded, so the
 // built viewer opens a window immediately and streams the model in as the
 // parser stages complete: vertices first (meshes appear, default colors),
@@ -147,6 +147,7 @@ size_t g_statN = 0;                    // averaged frames (skips the first 10)
 // the first scene frame and saves the whole run (for PIX timeline analysis
 // of per-draw GPU work) ----
 std::string g_pixPath;
+int g_pixStartFrame = 0;        // begin PIX capture at this frame (skip load)
 bool g_pixStarted = false;
 
 // Loads the newest %ProgramFiles%\Microsoft PIX\<version>\WinPixGpuCapturer
@@ -659,6 +660,8 @@ int main(int argc, char** argv) {
             g_statName = argv[++i];   // per-frame CSV + compare-table tag
         } else if (a == "--pix" && i + 1 < argc) {
             g_pixPath = argv[++i];    // programmatic GPU capture target
+        } else if (a == "--pixStart" && i + 1 < argc) {
+            g_pixStartFrame = std::atoi(argv[++i]);   // skip warm-up frames
         } else if (a.rfind("--", 0) != 0) {
             model = a;
         } else {
@@ -820,10 +823,13 @@ int main(int argc, char** argv) {
                         << "frame,cpu_ms,gpu_ms,scene_ms,ovl_ms,wait_ms,"
                            "record_ms\n";
                 }
-                // PIX GPU capture: start on the first scene frame (the
-                // loading overlay and the parser already ran; what follows
-                // is steady-state scene rendering) and stop after the loop
-                if (!g_pixStarted && !g_pixPath.empty()) {
+                // PIX GPU capture: start at --pixStart (default: the first
+                // scene frame, after the loading overlay and parser ran).
+                // A later start skips the texture-upload-heavy first frames
+                // so PIX's high-frequency counter window lands on
+                // steady-state rendering. Capture stops after the loop.
+                if (!g_pixStarted && !g_pixPath.empty() &&
+                    framesAll >= uint64_t(g_pixStartFrame)) {
                     std::wstring wp(g_pixPath.begin(), g_pixPath.end());
                     PIXCaptureParameters pix{};
                     pix.GpuCaptureParameters.FileName = wp.c_str();
