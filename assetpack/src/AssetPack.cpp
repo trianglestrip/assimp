@@ -140,6 +140,7 @@ void AssetPack::setOnMaterialsReady(MaterialsReady cb) { onMats_  = std::move(cb
 void AssetPack::setOnTexturesReady(TexturesReady cb)   { onTexs_  = std::move(cb); }
 void AssetPack::setOnAllDone(AllDone cb)               { onAll_   = std::move(cb); }
 void AssetPack::setProgress(Progress cb)               { onProgress_ = std::move(cb); }
+void AssetPack::setGeoStream(GeoStreamSink sink)       { geoStream_ = std::move(sink); }
 void AssetPack::setWantNormals(bool want)              { wantNormals_ = want; }
 
 bool AssetPack::ensureParser(std::string_view path) {
@@ -160,6 +161,7 @@ void AssetPack::attachCallbacks() {
     parser_->setOnTexturesReady(onTexs_);
     parser_->setOnAllDone(onAll_);
     parser_->setProgress(onProgress_);
+    parser_->setGeoStream(geoStream_);
     parser_->setWantNormals(wantNormals_);
 }
 

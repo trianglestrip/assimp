@@ -42,6 +42,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +55,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -114,6 +116,7 @@ float g_offX = 0.f, g_offZ = 0.f;          // WASD view-space offsets
 float g_offY = 0.f;                        // Q/E world-space camera height
 bool g_cullFrontZ = true;                  // true: CCW front faces have +z winding
 bool g_autoRotate = false;                 // --autoRotate: orbit yaw each frame
+bool g_nostream = false;                   // --nostream: blocking setGeometry upload
 
 // parser pool pointers captured at onVerticesReady (the pack outlives the
 // frame loop, so they stay valid); DxRenderer stages its geometry straight
@@ -123,6 +126,21 @@ const float* g_uvPool = nullptr;           // null when the model has no uvs
 const uint32_t* g_idxPool = nullptr;
 size_t g_idxCount = 0;
 size_t g_poolVerts = 0;
+
+// ---- geometry streaming (parse/upload overlap) ----
+// The parser publishes pool ranges as they finish filling (see
+// GeoStreamSink); the onRange callback copies them into the GPU staging
+// ring right on the parser worker, so the memcpy bandwidth is hidden
+// under the parse itself. onRange waits for beginGeometryStream (the
+// frame loop starts it when onMeta arrives), which also handles the
+// zero uv fill for models without texcoords.
+std::mutex g_geoMx;
+std::condition_variable g_geoCv;
+std::atomic<bool> g_geoMetaReady{false};   // pool sizes known (prefix)
+std::atomic<bool> g_geoBegun{false};       // buffers created, ring up
+std::atomic<size_t> g_geoVerts{0}, g_geoTris{0};
+std::atomic<bool> g_geoHasUv{false};
+std::atomic<uint64_t> g_geoBytes{0};       // bytes copied to the GPU
 
 // ---- runtime flags ----
 int g_frames = 0;                          // 0 = until quit
@@ -211,6 +229,24 @@ static void benchAppend(const std::string& line) {
 
 static double secsSince(Clock::time_point t0) {
     return std::chrono::duration<double>(Clock::now() - t0).count();
+}
+
+// Upload entry point: called on parser workers with a finished pool
+// range. Copies straight into the GPU staging ring (stageGeometryRange
+// is mutex-serialized); the range's data stays valid until the
+// publishing task returns, and the copy happens inside this call, so
+// there is no pool-lifetime race with seamFill's resize. Parser
+// workers can block up to the time it takes the frame loop to create
+// the buffers (beginGeometryStream), which is a few hundred ms once,
+// at most, for the first few chunks.
+static void stageGeoRange(ap::GeoRangeKind kind, size_t offsetBytes,
+                          const void* data, size_t sizeBytes) {
+    {
+        std::unique_lock<std::mutex> lk(g_geoMx);
+        g_geoCv.wait(lk, [] { return g_geoBegun.load(); });
+    }
+    g_dx->stageGeometryRange(kind, offsetBytes, data, sizeBytes);
+    g_geoBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
 }
 
 static std::string msStr(double v) {
@@ -434,6 +470,29 @@ static void bindTextures() {
 
 static void bindEvents(ap::AssetPack& pack) {
     pack.setProgress([](float pct) { g_progress.store(pct); });
+
+    // geometry streaming: publish pool ranges as they finish filling so
+    // the consumer can copy them while the parse still runs (meta at
+    // prefix, positions/indices per pass2 chunk, texcoords per pass3
+    // chunk, seam splits at seamFill). Models without texcoords get a
+    // zero uv buffer from beginGeometryStream once the frame loop sees
+    // onMeta. Skipped with --nostream (blocking setGeometry A/B).
+    if (!g_nostream) {
+        pack.setGeoStream({
+            [](size_t verts, size_t tris, bool hasUv) {
+                {
+                    std::lock_guard<std::mutex> lk(g_geoMx);
+                    g_geoVerts.store(verts);
+                    g_geoTris.store(tris);
+                    g_geoHasUv.store(hasUv);
+                }
+                g_geoMetaReady.store(true);
+            },
+            [](ap::GeoRangeKind kind, size_t offsetBytes, const void* data,
+               size_t sizeBytes) {
+                stageGeoRange(kind, offsetBytes, data, sizeBytes);
+            }});
+    }
 
     pack.setOnVerticesReady(
         [](ap::PackResult& r, std::span<const ap::PackMesh> meshes) {
@@ -665,6 +724,8 @@ int main(int argc, char** argv) {
             g_pixStartFrame = std::atoi(argv[++i]);   // skip warm-up frames
         } else if (a == "--autoRotate") {
             g_autoRotate = true;          // orbit the model each frame
+        } else if (a == "--nostream") {
+            g_nostream = true;            // A/B: blocking setGeometry upload
         } else if (a == "--camDist" && i + 1 < argc) {
             g_camDist = float(std::atof(argv[++i]));   // allow < 0.15 (inside)
         } else if (a.rfind("--", 0) != 0) {
@@ -712,10 +773,9 @@ int main(int argc, char** argv) {
     {
         ap::AssetPack pack;              // outlives the frame loop; its
         bindEvents(pack);                // destructor drains the executor
-        // the scene shader lights nothing: it needs only pos+uv, so
-        // skipping the per-vertex normal expansion saves up to ~3/8 of
-        // the geometry pool (normals + vn refs) on big models
-        pack.setWantNormals(false);
+        // normals stay parsed: the loader's sequential prefetch
+        // overlaps disk reads with the scan passes, so keeping the
+        // normal pool costs memory but barely moves the parse time
         pack.loadAsync(model);
 
         std::optional<Clock::time_point> tAll;
@@ -789,19 +849,38 @@ int main(int argc, char** argv) {
             ImGui::Render();
             const auto tUi0 = Clock::now();
 
-            // stage the parser pools once (idempotent) as soon as they
-            // exist. With the corrected +y-up NDC the view-space CCW
-            // front side stays CCW on screen; the old negated Y scale
-            // mirrored winding, so this flag flipped with it
-            if (g_vertsReady.load() && g_posPool && !g_dx->geometryReady()) {
-                g_dx->setGeometry(g_posPool, g_poolVerts, g_uvPool, g_idxPool,
-                                  g_idxCount, g_cullFrontZ);
-                // setGeometry copies the pools into GPU upload buffers
-                // synchronously; the CPU-side pools (~2 GB on the big
-                // tiled model) are dead weight once the upload returned.
-                // This also drops the parse-time peak before the steady
-                // frame loop starts.
+            // geometry: the streaming path has the parser publish pool
+            // ranges as they finish (meta at prefix, positions/indices
+            // per pass2 chunk, uv per pass3 chunk, seam splits at
+            // seamFill); onRange copies them into GPU staging right on
+            // the parser worker, so the upload overlaps the parse
+            // itself. --nostream keeps the old blocking setGeometry
+            // upload for A/B comparisons.
+            if (!g_nostream) {
+                if (g_geoMetaReady.load() && !g_geoBegun.load()) {
+                    g_dx->beginGeometryStream(g_geoVerts.load(),
+                                              g_geoTris.load(),
+                                              g_geoHasUv.load());
+                    g_geoBegun.store(true);
+                    g_geoCv.notify_all();   // unblock early onRange waits
+                }
+                if (g_vertsReady.load() && g_geoBegun.load() &&
+                    !g_dx->geometryReady()) {
+                    g_dx->finalizeGeometryStream(g_cullFrontZ);
+                    // the pools were streamed out as they filled; free
+                    // the remainder (normals, scratch, unwritten slots)
+                    // so the steady frame loop starts low-watermark
+                    pack.releaseGeometry();
+                    AP_LOG("viewer", "geometry streamed: %llu MB in %.1f s",
+                           (unsigned long long)(g_geoBytes.load() >> 20),
+                           secsSince(g_tLoad));
+                }
+            } else if (g_vertsReady.load() && !g_dx->geometryReady()) {
+                g_dx->setGeometry(g_posPool, g_poolVerts, g_uvPool,
+                                  g_idxPool, g_idxCount, g_cullFrontZ);
                 pack.releaseGeometry();
+                AP_LOG("viewer", "geometry uploaded (blocking) in %.1f s",
+                       secsSince(g_tLoad));
             }
             if (!g_vertsReady.load() || !g_dx->geometryReady()) {
                 // loading overlay: rasterize off-thread on progress

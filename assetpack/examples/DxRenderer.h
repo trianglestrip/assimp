@@ -30,6 +30,8 @@
 
 #include <SDL2/SDL.h>
 
+#include <assetpack/AssetPack.h>
+
 #include "TexPipeline.h"
 
 class DxRenderer {
@@ -59,6 +61,18 @@ public:
     // shader compilation happens at init, not mid-frame
     void setGeometry(const float* pos, size_t vertCount, const float* uv,
                      const uint32_t* idx, size_t idxCount, bool frontCCW);
+
+    // streaming geometry upload (large models): begin allocates the
+    // VB/IB and a staging ring and leaves a command list open;
+    // stageGeometryRange copies one parser pool range into the ring
+    // (called from the upload thread); finalize builds the PSO,
+    // transitions the buffers, submits the copies and waits the GPU.
+    // Uploads overlap the parse tail, and the ring caps staging at
+    // ~256 MB instead of one full pool-sized copy.
+    void beginGeometryStream(size_t verts, size_t tris, bool hasUv);
+    void stageGeometryRange(ap::GeoRangeKind kind, size_t offsetBytes,
+                            const void* data, size_t sizeBytes);
+    void finalizeGeometryStream(bool frontCCW);
 
     // scene frame: camera constants (see the viewer for the layout),
     // one DrawItem per mesh, decoded textures (a bounded chunk uploads

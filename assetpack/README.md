@@ -81,10 +81,21 @@ build\Release\assetpack_viewer.exe --wait --frames 300 --stat opt1   # 每帧记
   帧调度;解析与显示共用 taskflow:解析侧 chunk 并行 + 接缝分裂,
   显示侧 HUD/加载条在独立 `tf::Executor` 上异步光栅化(最新完成
   交接,渲染线程零等待)。帧调度为双缓冲在飞(按帧 fence 等待,
-  不再全量等 GPU 空闲)、几何零拷贝上传(positions/texcoords/索引
-  池原样进 VBO/IBO)、贴图分帧上传并即用即释。绘制前按贴图槽对
-  draw item 排序，渲染器每段贴图只绑定一次描述符表（2203 draws
-  录制 ~3.2 ms，优化前 ~3.6 ms）。
+  不再全量等 GPU 空闲)、几何流式上传(见下)、贴图分帧上传并即用
+  即释。绘制前按贴图槽对 draw item 排序，渲染器每段贴图只绑定
+  一次描述符表（2203 draws 录制 ~3.2 ms，优化前 ~3.6 ms）。
+- 几何流式上传:解析器在 prefix 任务发布 meta(总顶点/三角形数、
+  是否有 uv),pass2 每块填充完 positions/索引立即发布范围,
+  pass3 每块发布 texcoords,纹理接缝分裂产生的顶点在 seamFill
+  发布 —— 回调直接在解析 worker 上 memcpy 进 8×32MB 的 UPLOAD
+  ring(staging),按 64MB 成批提交并用 fence 跟踪槽位复用,上传与
+  解析完全重叠。主线程帧循环见到 meta 后建 default-heap 缓冲,
+  顶点全部就绪后 finalize(等待在飞批次、构建 PSO 等收尾)即开渲。
+  实测 1.93GB 几何(powerplant_x9,1.148 亿三角形):阻塞上传需
+  ~3.3s,流式把它藏进 ~5-6s 的解析时间里,同 warm-cache 下
+  "解析到显示"从 9.8s 降到 5.6s;材质/贴图在解析期间并行
+  mmap+解码,顶点就绪时贴图已在 GPU(或有界分帧上传中)。
+  `--nostream` 可切回阻塞上传做 A/B 对比。
 - ImGui HUD（third_party/imgui 静态库）：面板实时显示模型名、三角形
   数、CPU/GPU 帧时间、scene/overlay 分段、贴图数；GPU 时间用 D3D12
   timestamp query 环测量（延迟两帧读回，不阻塞热路径）。

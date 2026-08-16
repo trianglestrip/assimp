@@ -6,7 +6,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef _WIN32_WINNT          // PrefetchVirtualMemory / MEMORY_RANGE_ENTRY
+#define _WIN32_WINNT 0x0602   // need Windows 8+ API surface
+#endif
 #include <Windows.h>
+
+#include <algorithm>
 
 namespace ap {
 
@@ -70,6 +75,36 @@ size_t MappedFile::size() const { return bytes_.size(); }
 
 std::string_view MappedFile::text() const {
     return { reinterpret_cast<const char*>(bytes_.data()), bytes_.size() };
+}
+
+// PrefetchVirtualMemory is only advisory and pages in up to 64 entries
+// per call (Windows 8.1+); walk the range in 64-page batches. The call
+// itself is a kernel hint - it never blocks on disk, the read happens
+// in the background. Non-Windows builds get a compile-time no-op.
+bool MappedFile::prefetch(size_t offset, size_t len) const {
+    if (!base_ || offset >= bytes_.size()) return false;
+    len = std::min(len, bytes_.size() - offset);
+    if (len == 0) return false;
+#ifdef _WIN32
+    static constexpr size_t kPagesPerCall = 64;
+    static constexpr size_t kPage = 4096;
+    const size_t start = offset / kPage * kPage;
+    const size_t end = (offset + len + kPage - 1) / kPage * kPage;
+    size_t off = start;
+    while (off < end) {
+        WIN32_MEMORY_RANGE_ENTRY e;
+        e.VirtualAddress = static_cast<char*>(base_) + off;
+        e.NumberOfBytes = std::min(kPagesPerCall * kPage, end - off);
+        if (!::PrefetchVirtualMemory(::GetCurrentProcess(), 1, &e, 0))
+            return false;
+        off += e.NumberOfBytes;
+    }
+    return true;
+#else
+    (void)offset;
+    (void)len;
+    return false;
+#endif
 }
 
 } // namespace ag

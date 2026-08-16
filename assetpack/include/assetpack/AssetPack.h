@@ -71,6 +71,12 @@ public:
     // Convenience: reinterpret the mapping as chars
     std::string_view text() const;
 
+    // Windows: issue PrefetchVirtualMemory for [offset, offset+len) so
+    // the next consumer of the mapping finds its pages resident.
+    // Cheap when the pages are already cached; a no-op elsewhere.
+    // Returns true when the range was accepted.
+    bool prefetch(size_t offset, size_t len) const;
+
     // Shared ownership so views can outlive the loader object.
     static std::shared_ptr<MappedFile> openShared(std::string_view path);
 
@@ -175,6 +181,23 @@ struct PackResult {
     uint64_t totalMicros = 0;
 };
 
+// ---- geometry streaming (GPU upload overlap) ----
+// Pool ranges the parser publishes as they finish filling, so a
+// consumer can upload them while the rest of the file still parses
+// (OBJ: meta at prefix, positions/indices per pass2 chunk, texcoords
+// per pass3 chunk, seam splits at seamFill). Callbacks fire on parser
+// worker threads and may run concurrently; they must only copy out or
+// enqueue the bytes (the published memory stays valid until the
+// publishing task returns). onMeta fires once, before the first
+// onRange. data == nullptr in onRange means "zero-fill sizeBytes
+// bytes" (models without texcoords upload a zero uv buffer).
+enum class GeoRangeKind { Pos, Uv, Idx };
+struct GeoStreamSink {
+    std::function<void(size_t verts, size_t tris, bool hasUv)> onMeta;
+    std::function<void(GeoRangeKind kind, size_t offsetBytes,
+                       const void* data, size_t sizeBytes)> onRange;
+};
+
 // ---- base class: event plumbing, subclasses implement parsing ----
 class ModelParser {
 public:
@@ -219,6 +242,13 @@ public:
     // Saves ~3/4 of the parse-time pool on huge models.
     void releaseGeometry();
 
+    // Streaming sink for GPU uploads (see GeoStreamSink); set before
+    // load. Parsers that cannot stream (non-OBJ) ignore the call; the
+    // sink is read-only while a parse runs, so the callbacks may fire
+    // from any parser worker thread.
+    void setGeoStream(GeoStreamSink sink) { geoStream_ = std::move(sink); }
+    const GeoStreamSink& geoStream() const { return geoStream_; }
+
 protected:
     // subclasses call these when a stage completes
     void fireVertices(PackResult& r, std::span<const PackMesh> m) const;
@@ -239,6 +269,7 @@ private:
     TexturesReady  onTexs_;
     AllDone        onAll_;
     Progress       onProgress_;
+    GeoStreamSink  geoStream_;   // set before load; read-only during it
 };
 
 // ============================================================
@@ -310,6 +341,9 @@ public:
     void setOnAllDone(AllDone cb);
     void setProgress(Progress cb);
 
+    // Streaming geometry upload sink (see ModelParser::setGeoStream)
+    void setGeoStream(GeoStreamSink sink);
+
     // Parser attribute opt-outs (applied to the parser the facade
     // creates; ignored by parsers without the section)
     void setWantNormals(bool want);
@@ -339,6 +373,7 @@ private:
     TexturesReady  onTexs_;
     AllDone        onAll_;
     Progress       onProgress_;
+    GeoStreamSink  geoStream_;   // forwarded to the parser at load
 };
 
 } // namespace ap

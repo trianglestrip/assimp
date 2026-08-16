@@ -21,12 +21,14 @@
 #include <SpriteBatch.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -245,6 +247,120 @@ struct DxRenderer::Impl {
         const UINT64 v = ++fenceCounter;
         queue->Signal(fence.Get(), v);
         waitFence(v);
+    }
+
+    // ---- geometry streaming (parse-overlapped upload) ----
+    // Own list/allocator/staging ring/fence so the upload thread never
+    // touches the per-frame path; copies are submitted in ~64 MB
+    // batches and the ring cycles once the GPU finishes each slot.
+    static constexpr size_t kSlotCap = 32u << 20;   // staging slot
+    static constexpr UINT kSlots = 8;               // ring depth (256 MB)
+    struct StageSlot {
+        ComPtr<ID3D12Resource> res;
+        void* mapped = nullptr;
+        size_t used = 0;
+        UINT64 fenceAt = 0;   // batch whose copies this slot feeds
+    };
+    ComPtr<ID3D12CommandAllocator> geoAlloc;
+    ComPtr<ID3D12GraphicsCommandList> geoList;
+    ComPtr<ID3D12Fence> geoFence;
+    HANDLE geoFenceEvt = nullptr;
+    UINT64 geoFenceVal = 0;
+    std::array<StageSlot, kSlots> stages;
+    UINT stageIdx = 0;
+    UINT64 geoPending = 0;   // bytes recorded since the last submit
+    bool geoOpen = false;
+    std::mutex geoMx;   // upload thread vs finalize (list + ring)
+
+    void waitGeo(UINT64 v) {
+        if (geoFence->GetCompletedValue() >= v) return;
+        geoFence->SetEventOnCompletion(v, geoFenceEvt);
+        WaitForSingleObject(geoFenceEvt, INFINITE);
+    }
+
+    void advanceStage() {   // caller holds geoMx
+        StageSlot& s = stages[stageIdx];
+        if (s.fenceAt) waitGeo(s.fenceAt);
+        s.fenceAt = 0;
+        s.used = 0;
+        stageIdx = (stageIdx + 1) % kSlots;
+    }
+
+    // submit the recorded copies so the GPU can drain the ring; the
+    // single allocator is reused only after the batch just submitted
+    // completes, so exactly one batch is in flight at a time (the GPU
+    // copies 64 MB in ~5 ms while the CPU memcpy takes ~20 ms, so the
+    // ring still gives the CPU its head start)
+    void flushGeoBatch() {   // caller holds geoMx
+        geoList->Close();
+        ID3D12CommandList* lists[] = {geoList.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        ++geoFenceVal;
+        queue->Signal(geoFence.Get(), geoFenceVal);
+        waitGeo(geoFenceVal);
+        for (StageSlot& s : stages)
+            if (s.used) s.fenceAt = geoFenceVal;
+        geoPending = 0;
+        geoAlloc->Reset();
+        geoList->Reset(geoAlloc.Get(), nullptr);
+    }
+
+    void geoBarrier(ID3D12Resource* r, D3D12_RESOURCE_STATES a,
+                    D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER br{};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = r;
+        br.Transition.Subresource = 0;
+        br.Transition.StateBefore = a;
+        br.Transition.StateAfter = b;
+        geoList->ResourceBarrier(1, &br);
+    }
+
+    // scene PSO (shaders compiled at init; PSO built once at the first
+    // geometry staging - setGeometry or the stream finalize)
+    void buildScenePso(bool frontCCW) {
+        if (pso) return;
+        D3D12_INPUT_ELEMENT_DESC layout[2] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0,
+             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        };
+        D3D12_RASTERIZER_DESC rast{};    // zero-init = D3D12 default states
+        rast.FillMode = D3D12_FILL_MODE_SOLID;
+        rast.CullMode = D3D12_CULL_MODE_BACK;
+        rast.FrontCounterClockwise = frontCCW;
+        rast.DepthClipEnable = TRUE;
+        D3D12_DEPTH_STENCIL_DESC dss{};
+        dss.DepthEnable = TRUE;
+        dss.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        dss.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        D3D12_BLEND_DESC blend{};
+        blend.RenderTarget[0].RenderTargetWriteMask =
+            D3D12_COLOR_WRITE_ENABLE_ALL;
+        // alpha-to-coverage instead of a PS discard: foliage cutout
+        // edges get real MSAA coverage (1-3 of 4 samples) instead of
+        // one-bit jaggies
+        blend.AlphaToCoverageEnable = TRUE;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.Get();
+        pd.VS = {vsBlob->GetBufferPointer(), vsBlob->GetBufferSize()};
+        pd.PS = {psBlob->GetBufferPointer(), psBlob->GetBufferSize()};
+        pd.InputLayout = {layout, 2};
+        pd.RasterizerState = rast;
+        pd.DepthStencilState = dss;
+        pd.BlendState = blend;
+        pd.SampleMask = UINT_MAX;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pd.SampleDesc = {kMsaaSamples, 0};
+        if (FAILED(dev->CreateGraphicsPipelineState(&pd,
+                                                    IID_PPV_ARGS(&pso)))) {
+            AP_LOG_WARN("dx", "scene PSO failed");
+            return;
+        }
     }
 
     // ---- frame prologue: wait only for the frame two submissions ago ----
@@ -888,6 +1004,19 @@ void DxRenderer::shutdown() {
     dx.sprites.reset();
     dx.gfxMem.reset();
     dx.upload.reset();
+    // geometry stream resources (upload thread must be joined before
+    // shutdown; stageGeometryRange is never called past finalize)
+    for (Impl::StageSlot& s : dx.stages) {
+        if (s.mapped) s.res->Unmap(0, nullptr);
+        s.mapped = nullptr;
+        s.res.Reset();
+    }
+    if (dx.geoFenceEvt) CloseHandle(dx.geoFenceEvt);
+    dx.geoFenceEvt = nullptr;
+    dx.geoList.Reset();
+    dx.geoAlloc.Reset();
+    dx.geoFence.Reset();
+    dx.geoOpen = false;
     dx.pso.Reset();
     dx.rs.Reset();
     dx.vsBlob.Reset();
@@ -923,46 +1052,9 @@ void DxRenderer::setGeometry(const float* pos, size_t vertCount, const float* uv
                              bool frontCCW) {
     if (!up_ || psoUp_) return;
     Impl& dx = *impl_;
+    const auto t0 = std::chrono::steady_clock::now();
 
-    D3D12_INPUT_ELEMENT_DESC layout[2] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    };
-    D3D12_RASTERIZER_DESC rast{};        // zero-init = D3D12 default states
-    rast.FillMode = D3D12_FILL_MODE_SOLID;
-    rast.CullMode = D3D12_CULL_MODE_BACK;
-    rast.FrontCounterClockwise = frontCCW;
-    rast.DepthClipEnable = TRUE;
-    D3D12_DEPTH_STENCIL_DESC dss{};
-    dss.DepthEnable = TRUE;
-    dss.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    dss.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    D3D12_BLEND_DESC blend{};
-    blend.RenderTarget[0].RenderTargetWriteMask =
-        D3D12_COLOR_WRITE_ENABLE_ALL;
-    // alpha-to-coverage instead of a PS discard: foliage cutout edges get
-    // real MSAA coverage (1-3 of 4 samples) instead of one-bit jaggies
-    blend.AlphaToCoverageEnable = TRUE;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = dx.rs.Get();
-    pd.VS = {dx.vsBlob->GetBufferPointer(), dx.vsBlob->GetBufferSize()};
-    pd.PS = {dx.psBlob->GetBufferPointer(), dx.psBlob->GetBufferSize()};
-    pd.InputLayout = {layout, 2};
-    pd.RasterizerState = rast;
-    pd.DepthStencilState = dss;
-    pd.BlendState = blend;
-    pd.SampleMask = UINT_MAX;
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    pd.SampleDesc = {kMsaaSamples, 0};
-    if (FAILED(dx.dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&dx.pso)))) {
-        AP_LOG_WARN("dx", "scene PSO failed");
-        return;
-    }
+    dx.buildScenePso(frontCCW);
 
     // the parser pools upload verbatim: positions (3f), texcoords (2f) and
     // the packed index pool are already GPU layouts - no interleave, no
@@ -981,6 +1073,7 @@ void DxRenderer::setGeometry(const float* pos, size_t vertCount, const float* uv
         uvZero.assign(vertCount * 2, 0.f);
         uv = uvZero.data();
     }
+    const auto tA = std::chrono::steady_clock::now();   // buffers created
 
     if (dx.uploadDone.valid())
         dx.uploadDone.wait();
@@ -1001,6 +1094,17 @@ void DxRenderer::setGeometry(const float* pos, size_t vertCount, const float* uv
                           D3D12_RESOURCE_STATE_INDEX_BUFFER);
     dx.uploadDone = dx.upload->End(dx.queue.Get());   // awaited next frame
     dx.uploadOpen = false;
+    const auto t1 = std::chrono::steady_clock::now();
+    AP_LOG("dx", "geometry stage split: buffers %llu | upload %llu | end %llu us",
+           static_cast<unsigned long long>(
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   tA - t0).count()),
+           static_cast<unsigned long long>(
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   t1 - tA).count()),
+           static_cast<unsigned long long>(
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - t1).count()));
 
     dx.vbvPos = {dx.vbPos->GetGPUVirtualAddress(), UINT(posBytes),
                  sizeof(float) * 3};
@@ -1010,8 +1114,131 @@ void DxRenderer::setGeometry(const float* pos, size_t vertCount, const float* uv
               DXGI_FORMAT_R32_UINT};
 
     psoUp_ = true;
-    AP_LOG("dx", "geometry staged: %zu verts, %zu indices (zero-copy pools)",
-           vertCount, idxCount);
+    AP_LOG("dx", "geometry staged: %zu verts, %zu indices in %llu us "
+           "(zero-copy pools)",
+           vertCount, idxCount,
+           static_cast<unsigned long long>(
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - t0).count()));
+}
+
+void DxRenderer::beginGeometryStream(size_t verts, size_t tris, bool hasUv) {
+    if (!up_ || psoUp_) return;
+    Impl& dx = *impl_;
+    const auto t0 = std::chrono::steady_clock::now();
+    const UINT64 posBytes = UINT64(verts) * 3 * sizeof(float);
+    const UINT64 uvBytes = UINT64(verts) * 2 * sizeof(float);
+    const UINT64 ibBytes = UINT64(tris) * 3 * sizeof(uint32_t);
+    dx.vbPos = dx.makeBuf(posBytes, D3D12_HEAP_TYPE_DEFAULT,
+                          D3D12_RESOURCE_STATE_COPY_DEST);
+    dx.vbUv = dx.makeBuf(uvBytes, D3D12_HEAP_TYPE_DEFAULT,
+                         D3D12_RESOURCE_STATE_COPY_DEST);
+    dx.ib = dx.makeBuf(ibBytes, D3D12_HEAP_TYPE_DEFAULT,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
+    // dedicated list/fence + staging ring for the upload thread
+    dx.chk(dx.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          IID_PPV_ARGS(&dx.geoAlloc)),
+           "geo alloc");
+    dx.chk(dx.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                     dx.geoAlloc.Get(), nullptr,
+                                     IID_PPV_ARGS(&dx.geoList)),
+           "geo list");
+    dx.geoFenceEvt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    dx.chk(dx.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                               IID_PPV_ARGS(&dx.geoFence)),
+           "geo fence");
+    bool ok = true;
+    for (UINT i = 0; i < Impl::kSlots; ++i) {
+        dx.stages[i].res =
+            dx.makeBuf(Impl::kSlotCap, D3D12_HEAP_TYPE_UPLOAD,
+                       D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (FAILED(dx.stages[i].res->Map(0, nullptr,
+                                         &dx.stages[i].mapped)))
+            ok = false;
+    }
+    if (!ok) {
+        AP_LOG_WARN("dx", "geometry stream: staging map failed");
+        return;
+    }
+    dx.geoOpen = true;
+    // models without texcoords get a zero uv buffer; do it now, before
+    // any onRange publishes can lock geoMx from parser workers
+    if (!hasUv)
+        stageGeometryRange(ap::GeoRangeKind::Uv, 0, nullptr, uvBytes);
+    AP_LOG("dx", "geometry stream begun: %zu verts, %zu tris (hasUv %d) in "
+           "%llu us, staging %llu MB",
+           verts, tris, int(hasUv),
+           static_cast<unsigned long long>(
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - t0).count()),
+           (unsigned long long)(Impl::kSlotCap * Impl::kSlots >> 20));
+}
+
+void DxRenderer::stageGeometryRange(ap::GeoRangeKind kind,
+                                    size_t offsetBytes, const void* data,
+                                    size_t sizeBytes) {
+    if (!up_ || !impl_->geoOpen) return;
+    Impl& dx = *impl_;
+    ID3D12Resource* dst = kind == ap::GeoRangeKind::Uv
+                              ? dx.vbUv.Get()
+                              : kind == ap::GeoRangeKind::Idx ? dx.ib.Get()
+                                                              : dx.vbPos.Get();
+    std::lock_guard<std::mutex> lk(dx.geoMx);
+    size_t off = 0;
+    while (off < sizeBytes) {
+        Impl::StageSlot& s = dx.stages[dx.stageIdx];
+        if (s.used >= Impl::kSlotCap) dx.advanceStage();
+        const size_t chunk =
+            std::min(sizeBytes - off, Impl::kSlotCap - s.used);
+        char* slot = static_cast<char*>(s.mapped) + s.used;
+        if (data) {
+            memcpy(slot, static_cast<const char*>(data) + off, chunk);
+        } else {
+            memset(slot, 0, chunk);   // models without texcoords
+        }
+        dx.geoList->CopyBufferRegion(dst, offsetBytes + off, s.res.Get(),
+                                     s.used, chunk);
+        s.used += chunk;
+        dx.geoPending += chunk;
+        off += chunk;
+        if (dx.geoPending >= (64u << 20)) dx.flushGeoBatch();
+    }
+}
+
+void DxRenderer::finalizeGeometryStream(bool frontCCW) {
+    if (!up_ || psoUp_ || !impl_->geoOpen) return;
+    Impl& dx = *impl_;
+    const auto t0 = std::chrono::steady_clock::now();
+    dx.buildScenePso(frontCCW);
+    {
+        std::lock_guard<std::mutex> lk(dx.geoMx);
+        // the open list after the last flush: transitions then submit
+        dx.geoBarrier(dx.vbPos.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                      D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        dx.geoBarrier(dx.vbUv.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                      D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        dx.geoBarrier(dx.ib.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                      D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        dx.flushGeoBatch();
+        dx.waitGeo(dx.geoFenceVal);   // every copy complete
+    }
+    const UINT64 posBytes = UINT64(dx.vbPos->GetDesc().Width);
+    const UINT64 uvBytes = UINT64(dx.vbUv->GetDesc().Width);
+    const UINT64 ibBytes = UINT64(dx.ib->GetDesc().Width);
+    dx.vbvPos = {dx.vbPos->GetGPUVirtualAddress(), UINT(posBytes),
+                 sizeof(float) * 3};
+    dx.vbvUv = {dx.vbUv->GetGPUVirtualAddress(), UINT(uvBytes),
+                sizeof(float) * 2};
+    dx.ibv = {dx.ib->GetGPUVirtualAddress(), UINT(ibBytes),
+              DXGI_FORMAT_R32_UINT};
+    dx.geoOpen = false;
+    psoUp_ = true;
+    AP_LOG("dx", "geometry staged (streamed): %zu verts, %zu indices in "
+           "%llu us (overlapped with parse)",
+           size_t(posBytes / 12), size_t(ibBytes / 12),
+           static_cast<unsigned long long>(
+               std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - t0).count()));
 }
 
 void DxRenderer::drawLoading(const uint32_t* argb) {

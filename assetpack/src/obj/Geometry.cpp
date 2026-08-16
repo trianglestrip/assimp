@@ -163,6 +163,26 @@ void GeometryStage::run(tf::Subflow& sf) {
     const auto texMats = texMats_;
     const bool wantN = wantN_;
 
+    // Sequential prefetch thread: a multi-GB mapping can never stay
+    // fully resident on a 16 GB box, so each scan pass would refault
+    // pages evicted since the last one. Walking the file front to back
+    // with PrefetchVirtualMemory issues the disk reads up front (as
+    // one ordered stream) while the passes fault into the standby
+    // list instead of the disk. Joined after the graph drains; the
+    // thread is harmless (and near-instant) when pages are hot.
+    std::atomic<bool> pfStop{false};
+    std::thread pf([&]() {
+        const auto f = result->objFile;
+        if (!f) return;
+        const size_t sz = f->size();
+        constexpr size_t kStep = 8u << 20;
+        size_t off = 0;
+        while (!pfStop.load(std::memory_order_relaxed) && off < sz) {
+            f->prefetch(off, kStep);
+            off += kStep;
+        }
+    });
+
     // pass 1 (parallel): per-chunk counts + ordered markers
     tf::Task pass1 = sf.for_each_index(0, nChunks, 1, [chunks, data](int ci) {
         ChunkInfo& c = (*chunks)[size_t(ci)];
@@ -198,7 +218,8 @@ void GeometryStage::run(tf::Subflow& sf) {
 
     // prefix sums + flat-array allocation (serial, tiny)
     tf::Task prefix = sf.emplace([chunks, result, vnPool, uvPool, vnIdx, uvIdx,
-                                  nChunks, wantN, baseVerts, shards, tStart]() {
+                                  nChunks, wantN, baseVerts, shards, tStart,
+                                  this]() {
         AP_LOG("geometry", "pass1 done at %llu us",
                static_cast<unsigned long long>(microsSince(tStart)));
         size_t p = 0, n = 0, u = 0, t = 0;
@@ -239,6 +260,17 @@ void GeometryStage::run(tf::Subflow& sf) {
         for (detail::SeamShard& sh : *shards) {
             sh.seed(1u << 17);
             sh.added.reserve(1u << 17);
+        }
+        // geometry streaming: publish the buffer plan now (the split
+        // count is still unknown, so files with vt lines reserve one
+        // extra vertex per base vertex - covers every real model, and
+        // seamFill skips splits that would overflow). Pass 2 chunks
+        // publish their pos/idx ranges as they finish, so the consumer
+        // copies while the rest of the file still parses.
+        const GeoStreamSink& sink = owner_.geoStream();
+        if (sink.onMeta) {
+            const size_t cap = u ? p * 2 : p;   // split capacity
+            sink.onMeta(cap, t, u > 0);
         }
         AP_LOG("geometry", "pass1: %zu v / %zu vn / %zu vt / %zu tris",
                p, n, u, t);
@@ -281,7 +313,7 @@ void GeometryStage::run(tf::Subflow& sf) {
     // resolve 1-based / negative-relative indices per chunk
     tf::Task pass2 = sf.for_each_index(0, nChunks, 1,
         [chunks, result, vnPool, uvPool, vnIdx, uvIdx, data, wantN,
-         shards, seamCounter, baseVerts, texMats](int ci) {
+         shards, seamCounter, baseVerts, texMats, this](int ci) {
             ChunkInfo& c = (*chunks)[size_t(ci)];
             const char* p = data + c.begin;
             const char* end = data + c.end;
@@ -405,6 +437,19 @@ void GeometryStage::run(tf::Subflow& sf) {
                 }
                 p = eol + 1;
             }
+            // this chunk's pos/idx ranges are final: publish them so
+            // the consumer copies while later chunks still parse
+            const GeoStreamSink& sink = owner_.geoStream();
+            if (sink.onRange) {
+                if (c.nPos)
+                    sink.onRange(GeoRangeKind::Pos, c.basePos * 12,
+                                 result->positions.data() + c.basePos * 3,
+                                 c.nPos * 12);
+                if (c.nTri)
+                    sink.onRange(GeoRangeKind::Idx, c.baseTri * 12,
+                                 result->posIndices.data() + c.baseTri * 3,
+                                 c.nTri * 12);
+            }
         });
 
     // seam resolve: grow the pools by the split vertices and fill
@@ -412,16 +457,40 @@ void GeometryStage::run(tf::Subflow& sf) {
     // uv/normal straight from the vn/vt pools). Runs once, after all
     // pass2 chunks finish, so every split index is final here.
     tf::Task seamFill = sf.emplace([result, vnPool, uvPool, shards,
-                                    seamCounter,
-                                    baseVerts](tf::Subflow& inner) {
+                                    seamCounter, baseVerts,
+                                    this](tf::Subflow& inner) {
         const size_t base = *baseVerts;
         const size_t n = seamCounter->load();
+        if (n) {
+            result->positions.resize((base + n) * 3);
+            if (!result->normals.empty())
+                result->normals.resize((base + n) * 3);
+            if (!result->texcoords.empty())
+                result->texcoords.resize((base + n) * 2);
+        }
+        // geometry streaming: the meta (buffer plan) went out from the
+        // prefix task; pass2 chunks already published their pos/idx
+        // ranges, so only the seam-split range is new here. The prefix
+        // plan reserved one extra vertex per base vertex when the file
+        // has vt lines; a split count beyond that would overflow the
+        // GPU buffer, so cap the publish at the reserved capacity.
+        const GeoStreamSink& sink = owner_.geoStream();
+        if (n && sink.onRange && !result->texcoords.empty()) {
+            const size_t cap = uvPool->empty() ? base : base * 2;
+            if (base + n <= cap) {
+                sink.onRange(GeoRangeKind::Pos, base * 12,
+                             result->positions.data() + base * 3,
+                             n * 12);
+                sink.onRange(GeoRangeKind::Uv, base * 8,
+                             result->texcoords.data() + base * 2, n * 8);
+            } else {
+                AP_LOG("geometry",
+                       "seam splits exceed streamed capacity (%zu>%zu); "
+                       "split verts not uploaded",
+                       n, cap - base);
+            }
+        }
         if (!n) return;
-        result->positions.resize((base + n) * 3);
-        if (!result->normals.empty())
-            result->normals.resize((base + n) * 3);
-        if (!result->texcoords.empty())
-            result->texcoords.resize((base + n) * 2);
         // flatten the shard lists (cheap pointer gather), then fill
         // in parallel: entries write disjoint output slots
         std::vector<const std::pair<uint32_t, detail::SeamVert>*> entries;
@@ -481,41 +550,60 @@ void GeometryStage::run(tf::Subflow& sf) {
     // (the old form captured an empty range and silently skipped
     // the whole pass, leaving every texcoord/normal zero).
     tf::Task pass3 = sf.emplace(
-        [result, vnIdx, uvIdx, vnPool, uvPool, tStart,
-         baseVerts](tf::Subflow& inner) {
+        [result, vnIdx, uvIdx, vnPool, uvPool, chunks, nChunks, tStart,
+         baseVerts, this](tf::Subflow& inner) {
             // base slots only: seam splits were filled directly by
             // seamFill, and vnIdx/uvIdx stop at the base count
             const int nVerts = int(*baseVerts);
             if (nVerts <= 0) return;
             const auto t3 = Clock::now();
-            inner.for_each_index(0, nVerts, 1,
-                [result, vnIdx, uvIdx, vnPool, uvPool](int i) {
-                    const size_t iv = size_t(i);
+            // per-chunk blocks: pass2's claims are final, so slot i can
+            // expand in any order - walking chunk by chunk lets each
+            // completed block publish its texcoord range while the
+            // remaining chunks still parse (streaming upload)
+            inner.for_each_index(0, nChunks, 1,
+                [chunks, result, vnIdx, uvIdx, vnPool, uvPool,
+                 this](int ci) {
+                    const ChunkInfo& c = (*chunks)[size_t(ci)];
+                    const size_t begin = c.basePos;
+                    const size_t end = c.basePos + c.nPos;
                     const float* vn = vnPool->data();
                     const float* uv = uvPool->data();
-                    if (!result->normals.empty()) {
-                        const uint32_t in =
-                            std::atomic_ref<const uint32_t>((*vnIdx)[iv])
-                                .load(std::memory_order_relaxed);
-                        if (in != 0xFFFFFFFFu) {
-                            const size_t in3 = size_t(in) * 3;
-                            float* dst = result->normals.data() + iv * 3;
-                            dst[0] = vn[in3];
-                            dst[1] = vn[in3 + 1];
-                            dst[2] = vn[in3 + 2];
+                    const bool wantUv = !result->texcoords.empty();
+                    for (size_t iv = begin; iv < end; ++iv) {
+                        if (!result->normals.empty()) {
+                            const uint32_t in =
+                                std::atomic_ref<const uint32_t>(
+                                    (*vnIdx)[iv]).load(
+                                        std::memory_order_relaxed);
+                            if (in != 0xFFFFFFFFu) {
+                                const size_t in3 = size_t(in) * 3;
+                                float* dst =
+                                    result->normals.data() + iv * 3;
+                                dst[0] = vn[in3];
+                                dst[1] = vn[in3 + 1];
+                                dst[2] = vn[in3 + 2];
+                            }
+                        }
+                        if (wantUv) {
+                            const uint32_t iu =
+                                std::atomic_ref<const uint32_t>(
+                                    (*uvIdx)[iv]).load(
+                                        std::memory_order_relaxed);
+                            if (iu != 0xFFFFFFFFu) {
+                                const size_t iu2 = size_t(iu) * 2;
+                                float* dst =
+                                    result->texcoords.data() + iv * 2;
+                                dst[0] = uv[iu2];
+                                dst[1] = uv[iu2 + 1];
+                            }
                         }
                     }
-                    if (!result->texcoords.empty()) {
-                        const uint32_t iu =
-                            std::atomic_ref<const uint32_t>((*uvIdx)[iv])
-                                .load(std::memory_order_relaxed);
-                        if (iu != 0xFFFFFFFFu) {
-                            const size_t iu2 = size_t(iu) * 2;
-                            float* dst = result->texcoords.data() + iv * 2;
-                            dst[0] = uv[iu2];
-                            dst[1] = uv[iu2 + 1];
-                        }
-                    }
+                    if (wantUv && owner_.geoStream().onRange)
+                        owner_.geoStream().onRange(
+                            GeoRangeKind::Uv, begin * 2 * sizeof(float),
+                            result->texcoords.data() + begin * 2,
+                            (end - begin) * 2 * sizeof(float));
                 });
             inner.join();
             AP_LOG("geometry", "pass3 gather: %llu us over %d verts",
@@ -642,6 +730,9 @@ void GeometryStage::run(tf::Subflow& sf) {
     seamFill.precede(pass3);
     pass3.precede(build);
     sf.join();
+
+    pfStop = true;
+    pf.join();
 }
 
 } // namespace ap::obj
