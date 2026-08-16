@@ -69,6 +69,7 @@ San Miguel（1.14GB OBJ）实测：5.93M 位置顶点 / 9.98M 三角形 / 2203 m
 build\Release\assetpack_viewer.exe                # 默认模型
 build\Release\assetpack_viewer.exe model.obj      # 指定模型
 build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
+build\Release\assetpack_viewer.exe --wait --frames 300 --stat opt1   # 每帧记录
 ```
 
 - 仅原生 Direct3D 12 GPU 渲染:场景由查看器自定义 PSO 绘制,
@@ -87,6 +88,12 @@ build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
 - ImGui HUD（third_party/imgui 静态库）：面板实时显示模型名、三角形
   数、CPU/GPU 帧时间、scene/overlay 分段、贴图数；GPU 时间用 D3D12
   timestamp query 环测量（延迟两帧读回，不阻塞热路径）。
+- `--stat <name>` 每帧记录（UE STAT UNIT 风格）：以
+  `frame,cpu_ms,gpu_ms,scene_ms,ovl_ms,wait_ms,record_ms` 一行/帧写入
+  `stat/<name>.csv`，并在 benchmark.md 的 `## compare` 同项对比表追加
+  一行（版本标签 + 本次运行的导入/顶点数/各项均值）。`tools/stat_plot.html`
+  是零依赖折线图查看器：浏览器打开后多选 stat/*.csv 即可叠加对比不同
+  优化版本（下拉切换指标、图例点击隐藏、悬浮读值、虚线为均值）。
 - mmap + taskflow 的自定义 OBJ/MTL 解析器和 stb_image 贴图解码,
   不依赖 assimp;法线默认解析(`setWantNormals(false)` 可选跳过)。
 - 贴图上传后用 DirectXTK12 `GenerateMips` 在 GPU 生成完整 mip 链,
@@ -150,3 +157,8 @@ timestamp 频率被低估（timestamp 时钟跟随 GPU 动态核心时钟，读�
 收益）；mesh 合并（2203 draws → 按材质几百次，削减 CPU 录制）；
 depth prepass（过绘制场景的 PS 减负，双倍 draw 数）。60 fps 之上
 需要无合成器路径（独占全屏 / tearing），当前窗口化模式无法突破。
+
+**基准复现**：`--wait --frames 300 --stat <标签>` 每次运行往 benchmark.md
+追加一条 `## compare` 行（行=版本，列=指标，同项对比），并把每帧
+cpu/gpu/scene/ovl/wait/record 写入 `stat/<标签>.csv`；浏览器打开
+`tools/stat_plot.html` 多选 CSV 即可叠加折线对比不同优化版本。

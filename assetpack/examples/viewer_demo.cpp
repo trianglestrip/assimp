@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -128,6 +129,15 @@ uint64_t g_frameCount = 0;
 Clock::time_point g_tLoad;
 double g_cpuFrameMs = 0;                 // last loop iteration, shown by the overlay
 Clock::time_point g_tPrevLoop;           // frame pacing reference for the above
+
+// ---- per-frame STAT record (UE STAT UNIT style): --stat <name> writes
+// one CSV row per frame (cpu/gpu/scene/ovl/wait/record) plus the run
+// averages for the ## compare table in benchmark.md ----
+std::string g_statName;
+std::ofstream g_statFile;
+double g_accCpu = 0, g_accGpu = 0, g_accScene = 0, g_accOvl = 0;
+double g_accWait = 0, g_accRecord = 0;
+size_t g_statN = 0;                    // averaged frames (skips the first 10)
 
 // ---- DX12 backend state (the implementation lives in DxRenderer) ----
 std::unique_ptr<DxRenderer> g_dx;
@@ -549,6 +559,39 @@ static void benchRenderLine(uint64_t frames, double fps) {
     out << line;
 }
 
+// one row per --frames run: the same metric in the same column across
+// runs/optimizations, so successive runs accumulate a comparison table
+static void benchCompareLine(double fps) {
+    const char* header =
+        "## compare (per-run; same metric per column)\n"
+        "| version | time | import ms | verts | avg cpu ms | avg gpu ms |"
+        " avg scene ms | avg ovl ms | avg wait ms | avg record ms | avg fps |\n"
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        " ---: | ---: |\n";
+    std::ifstream in("benchmark.md", std::ios::binary);
+    std::string tail;
+    if (in) {
+        in.seekg(0, std::ios::end);
+        const std::streamoff len = in.tellg();
+        in.seekg(len > 2048 ? len - 2048 : 0);
+        tail.assign(std::istreambuf_iterator<char>(in),
+                    std::istreambuf_iterator<char>());
+    }
+    std::ofstream out("benchmark.md", std::ios::app);
+    if (tail.find("## compare") == std::string::npos) out << "\n" << header;
+    const double n = std::max(size_t(1), g_statN);
+    const std::string& ver =
+        g_statName.empty() ? g_modelName : g_statName;
+    char line[512];
+    std::snprintf(line, sizeof line,
+                  "| %s | %s | %.1f | %zu | %.2f | %.2f | %.2f | %.3f |"
+                  " %.2f | %.2f | %.1f |\n",
+                  ver.c_str(), timestamp().c_str(), g_importMs, g_poolVerts,
+                  g_accCpu / n, g_accGpu / n, g_accScene / n, g_accOvl / n,
+                  g_accWait / n, g_accRecord / n, fps);
+    out << line;
+}
+
 } // namespace
 
 // ============================================================
@@ -567,6 +610,8 @@ int main(int argc, char** argv) {
             g_shotAt = std::atoi(argv[i + 1]);
             g_shotFile = argv[i + 2];
             i += 2;
+        } else if (a == "--stat" && i + 1 < argc) {
+            g_statName = argv[++i];   // per-frame CSV + compare-table tag
         } else if (a.rfind("--", 0) != 0) {
             model = a;
         } else {
@@ -709,6 +754,19 @@ int main(int argc, char** argv) {
                 }
                 g_dx->drawLoading(load ? load->data() : nullptr);
             } else {
+                // per-frame STAT record: open on the first scene frame so
+                // the header carries the run tag; one CSV row per frame
+                // (UE STAT UNIT style) for offline plotting
+                if (g_statFile.is_open() == false && !g_statName.empty()) {
+                    std::filesystem::create_directories("stat");
+                    g_statFile.open("stat/" + g_statName + ".csv");
+                    g_statFile
+                        << "# version=" << g_statName
+                        << " model=" << g_modelName
+                        << " time=" << timestamp() << '\n'
+                        << "frame,cpu_ms,gpu_ms,scene_ms,ovl_ms,wait_ms,"
+                           "record_ms\n";
+                }
                 // camera constants: identical math to the software
                 // transform this viewer used to have (the vertex shader
                 // mirrors the layout)
@@ -772,6 +830,25 @@ int main(int argc, char** argv) {
                 }
             }
             ++g_frameCount;
+            // per-frame STAT row + running averages (skip the first ten
+            // frames: timestamp queries settle and pacing stabilizes)
+            if (g_statFile.is_open()) {
+                float wMs = 0, rMs = 0, gF = 0, gS = 0, gO = 0;
+                g_dx->cpuStats(wMs, rMs);
+                g_dx->gpuTiming(gF, gS, gO);
+                g_statFile << g_frameCount << ',' << g_cpuFrameMs << ',' << gF
+                           << ',' << gS << ',' << gO << ',' << wMs << ','
+                           << rMs << '\n';
+                if (g_frameCount > 10) {
+                    g_accCpu += g_cpuFrameMs;
+                    g_accGpu += gF;
+                    g_accScene += gS;
+                    g_accOvl += gO;
+                    g_accWait += wMs;
+                    g_accRecord += rMs;
+                    ++g_statN;
+                }
+            }
             // CPU frame time (displayed by the overlay next frame)
             const auto tLoop = Clock::now();
             g_cpuFrameMs =
@@ -812,6 +889,8 @@ int main(int argc, char** argv) {
                 break;
         }
         benchRenderLine(framesAll, fpsNow);
+        if (g_statN > 0) benchCompareLine(fpsNow);
+        g_statFile.close();
         AP_LOG("viewer", "rendered %llu frames (%.1f fps)",
                (unsigned long long)framesAll, fpsNow);
     }

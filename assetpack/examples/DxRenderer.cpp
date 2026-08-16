@@ -170,6 +170,9 @@ struct DxRenderer::Impl {
     UINT64 queryFreq = 1;
     uint64_t frameNo = 0;
     float gpuFrameMs = 0.f, gpuSceneMs = 0.f, gpuOverlayMs = 0.f;
+    // CPU-side per-frame timings (updated unconditionally, exported via
+    // cpuStats for the per-frame STAT record)
+    float waitMs = 0.f, recordMs = 0.f;
 
     ~Impl() {
         if (fenceEvt) CloseHandle(fenceEvt);
@@ -247,6 +250,8 @@ struct DxRenderer::Impl {
         const UINT f = swap->GetCurrentBackBufferIndex();
         waitFence(frameFence[f]);
         const auto tB1 = std::chrono::steady_clock::now();
+        waitMs = float(std::chrono::duration<double, std::milli>(tB1 - tB0)
+                           .count());
         if (uploadDone.valid())
             uploadDone.wait();          // uploads overlap, never pre-empt
         const auto tB2 = std::chrono::steady_clock::now();
@@ -846,6 +851,16 @@ void DxRenderer::gpuTiming(float& frameMs, float& sceneMs,
     overlayMs = dx.gpuOverlayMs;
 }
 
+void DxRenderer::cpuStats(float& waitMs, float& recordMs) const {
+    if (!impl_) {
+        waitMs = recordMs = 0.f;
+        return;
+    }
+    const Impl& dx = *impl_;
+    waitMs = dx.waitMs;
+    recordMs = dx.recordMs;
+}
+
 void DxRenderer::shutdown() {
     if (!up_ || !impl_) return;
     Impl& dx = *impl_;
@@ -1111,6 +1126,8 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
         dx.list->EndQuery(dx.queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                           UINT(dx.frameNo % dx.kQuerySlots) * 3 + 1);
     const auto tEn0 = std::chrono::steady_clock::now();
+    dx.recordMs = float(std::chrono::duration<double, std::milli>(tEn0 - tUp0)
+                            .count());
     if (dx.frames % 30 == 1) {
         AP_LOG("dx", "drawScene: begin %.2f | upload %.2f | record %.2f ms",
                std::chrono::duration<double, std::milli>(tDr0 - t0).count(),

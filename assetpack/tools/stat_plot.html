@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>assetpack STAT 折线图</title>
+<style>
+  body { font-family: "Segoe UI", system-ui, sans-serif; margin: 16px;
+         background: #1e1e1e; color: #ddd; }
+  h2 { margin: 0 0 4px; font-size: 18px; }
+  .sub { color: #999; font-size: 12px; margin-bottom: 12px; }
+  .bar { margin-bottom: 10px; display: flex; gap: 10px; align-items: center;
+         flex-wrap: wrap; }
+  input[type=file] { color: #bbb; }
+  select { background: #333; color: #ddd; border: 1px solid #555;
+           padding: 3px 6px; border-radius: 4px; }
+  #cv { border: 1px solid #444; background: #141414; border-radius: 4px;
+        max-width: 100%; cursor: crosshair; }
+  #legend { margin-top: 8px; font-size: 13px; }
+  .lg { display: inline-flex; align-items: center; gap: 6px; margin: 2px 14px 2px 0;
+        cursor: pointer; user-select: none; }
+  .sw { width: 18px; height: 3px; border-radius: 2px; display: inline-block; }
+  .off { opacity: .25; text-decoration: line-through; }
+  #tip { position: fixed; pointer-events: none; background: #000c;
+         border: 1px solid #666; border-radius: 4px; padding: 4px 8px;
+         font-size: 12px; font-family: Consolas, monospace; display: none;
+         white-space: pre; z-index: 9; }
+</style>
+</head>
+<body>
+<h2>assetpack 帧耗时折线图（--stat 每帧 CSV）</h2>
+<div class="sub">选择多个 stat/*.csv 叠加对比不同优化版本；同一指标纵轴为毫秒，横轴为帧序号。
+每帧一行的数据由 <code>assetpack_viewer.exe --stat &lt;name&gt; --frames N</code> 生成。</div>
+<div class="bar">
+  <input type="file" id="files" multiple accept=".csv">
+  <select id="metric">
+    <option value="cpu_ms">CPU 帧时间 (cpu_ms)</option>
+    <option value="gpu_ms" selected>GPU 帧时间 (gpu_ms)</option>
+    <option value="scene_ms">GPU 场景 (scene_ms)</option>
+    <option value="ovl_ms">GPU 覆盖层 (ovl_ms)</option>
+    <option value="wait_ms">fence 等待 (wait_ms)</option>
+    <option value="record_ms">绘制录制 (record_ms)</option>
+  </select>
+  <label><input type="checkbox" id="avg" checked> 显示均值线</label>
+</div>
+<canvas id="cv" width="1400" height="640"></canvas>
+<div id="legend"></div>
+<div id="tip"></div>
+
+<script>
+"use strict";
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const tip = document.getElementById("tip");
+const PALETTE = ["#4fc3f7", "#ffb74d", "#81c784", "#e57373", "#ba68c8",
+                 "#fff176", "#4dd0e1", "#f06292", "#aed581", "#ff8a65"];
+const METRICS = ["cpu_ms", "gpu_ms", "scene_ms", "ovl_ms", "wait_ms", "record_ms"];
+let series = [];          // { name, meta, rows: [ [v...] ] }
+let metric = "gpu_ms";
+let hidden = new Set();
+
+function parseCSV(text) {
+  const meta = [];
+  let header = null, cols = {}, rows = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (!line.trim()) continue;
+    if (line[0] === "#") { meta.push(line.slice(1).trim()); continue; }
+    const parts = line.split(",");
+    if (!header) {
+      header = parts;
+      parts.forEach((p, i) => { cols[p.trim()] = i; });
+      continue;
+    }
+    const row = parts.map(Number);
+    if (row.every(Number.isFinite)) rows.push(row);
+  }
+  return { meta, cols, rows };
+}
+
+function loadFiles(list) {
+  series = [];
+  hidden.clear();
+  let done = 0;
+  for (const f of list) {
+    const rd = new FileReader();
+    rd.onload = () => {
+      const p = parseCSV(String(rd.result));
+      series.push({ name: f.name.replace(/\.csv$/i, ""), meta: p.meta, cols: p.cols, rows: p.rows });
+      if (++done === list.length) { draw(); buildLegend(); }
+    };
+    rd.readAsText(f);
+  }
+}
+
+function colIndex(s) { return s.cols[metric]; }
+
+function dataFor(s) {
+  const ci = colIndex(s);
+  if (ci === undefined) return null;
+  const out = [];
+  for (const r of s.rows) out.push(r[ci]);
+  return out;
+}
+
+function yRange(datasets) {
+  let lo = Infinity, hi = -Infinity;
+  for (const d of datasets)
+    for (const v of d.data) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  if (!Number.isFinite(lo)) return null;
+  lo = Math.max(0, lo - (hi - lo) * 0.05);
+  hi = hi + (hi - lo) * 0.05 || lo + 1;
+  return { lo, hi };
+}
+
+function draw() {
+  const W = cv.width, H = cv.height, padL = 58, padR = 14, padT = 12, padB = 26;
+  const vis = series.filter(s => !hidden.has(s.name));
+  const datasets = vis.map(s => ({ s, data: dataFor(s) })).filter(d => d.data);
+  ctx.clearRect(0, 0, W, H);
+  if (!datasets.length) {
+    ctx.fillStyle = "#666"; ctx.font = "14px sans-serif";
+    ctx.fillText("加载一个或多个 stat/*.csv（--stat <name> 生成）", padL, H / 2);
+    return;
+  }
+  const { lo, hi } = yRange(datasets);
+  const maxLen = Math.max(...datasets.map(d => d.data.length));
+  const sx = (W - padL - padR) / Math.max(1, maxLen - 1);
+  const X = i => padL + i * sx;
+  const Y = v => H - padB - (v - lo) / (hi - lo) * (H - padT - padB);
+
+  // grid + axes
+  ctx.strokeStyle = "#333"; ctx.lineWidth = 1;
+  ctx.font = "11px Consolas, monospace"; ctx.fillStyle = "#999";
+  const steps = 5;
+  for (let k = 0; k <= steps; ++k) {
+    const v = lo + (hi - lo) * k / steps, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(v.toFixed(2), 8, y + 4);
+  }
+  ctx.fillText("帧", W - 30, H - 8);
+
+  // lines
+  datasets.forEach((d, i) => {
+    ctx.strokeStyle = PALETTE[i % PALETTE.length];
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    d.data.forEach((v, j) => j ? ctx.lineTo(X(j), Y(v)) : ctx.moveTo(X(0), Y(v)));
+    ctx.stroke();
+    // mean dashed line
+    if (document.getElementById("avg").checked && d.data.length) {
+      const m = d.data.reduce((a, b) => a + b, 0) / d.data.length;
+      ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, Y(m)); ctx.lineTo(W - padR, Y(m)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  });
+}
+
+function buildLegend() {
+  const lg = document.getElementById("legend");
+  lg.innerHTML = "";
+  series.forEach((s, i) => {
+    const el = document.createElement("span");
+    el.className = "lg";
+    el.innerHTML = `<span class="sw" style="background:${PALETTE[i % PALETTE.length]}"></span>${s.name}`;
+    const d = dataFor(s);
+    if (d && d.length) {
+      const m = d.reduce((a, b) => a + b, 0) / d.length;
+      const el2 = document.createElement("span");
+      el2.style.color = "#888";
+      el2.textContent = ` avg ${m.toFixed(2)} ms`;
+      el.appendChild(el2);
+    }
+    if (s.meta.length) {
+      const el3 = document.createElement("span");
+      el3.style.color = "#666"; el3.style.fontSize = "11px";
+      el3.textContent = " " + s.meta[0];
+      el.appendChild(el3);
+    }
+    el.onclick = () => {
+      hidden.has(s.name) ? hidden.delete(s.name) : hidden.add(s.name);
+      el.classList.toggle("off", hidden.has(s.name));
+      draw();
+    };
+    lg.appendChild(el);
+  });
+}
+
+cv.addEventListener("mousemove", e => {
+  const rect = cv.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * cv.width / rect.width;
+  const padL = 58, padR = 14;
+  const vis = series.filter(s => !hidden.has(s.name));
+  const datasets = vis.map(s => ({ s, data: dataFor(s) })).filter(d => d.data);
+  if (!datasets.length) { tip.style.display = "none"; return; }
+  const maxLen = Math.max(...datasets.map(d => d.data.length));
+  const sx = (cv.width - padL - padR) / Math.max(1, maxLen - 1);
+  const i = Math.round((x - padL) / sx);
+  if (i < 0 || i >= maxLen) { tip.style.display = "none"; return; }
+  let text = `帧 ${i}`;
+  datasets.forEach(d => {
+    const v = d.data[i];
+    if (v !== undefined) text += `\n${d.s.name}: ${v.toFixed(2)} ms`;
+  });
+  tip.textContent = text;
+  tip.style.display = "block";
+  tip.style.left = (e.clientX + 14) + "px";
+  tip.style.top = (e.clientY + 10) + "px";
+  // crosshair over the just-drawn chart
+  ctx.strokeStyle = "#777"; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL + i * sx, 12);
+  ctx.lineTo(padL + i * sx, cv.height - 26);   // vertical line across the plot
+  ctx.stroke(); ctx.setLineDash([]);
+});
+cv.addEventListener("mouseleave", () => { tip.style.display = "none"; draw(); });
+
+document.getElementById("files").addEventListener("change", e => loadFiles(e.target.files));
+document.getElementById("metric").addEventListener("change", e => { metric = e.target.value; buildLegend(); draw(); });
+document.getElementById("avg").addEventListener("change", draw);
+</script>
+</body>
+</html>

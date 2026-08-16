@@ -78,6 +78,11 @@ public:
     // draws only. Zero until a couple of frames have elapsed.
     void gpuTiming(float& frameMs, float& sceneMs, float& overlayMs) const;
 
+    // CPU-side per-frame timings (ms, updated every frame): wait = fence
+    // wait at Begin() (compositor pacing shows up here), record = time to
+    // record the scene draws into the command list
+    void cpuStats(float& waitMs, float& recordMs) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
