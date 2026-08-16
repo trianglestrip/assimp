@@ -17,8 +17,9 @@
 #include <assetpack/AssetPack.h>
 
 #include "ObjParser.h"
-#include "detail/SeamSplit.h"
 #include "Scan.h"
+
+namespace ap::detail { struct SeamShard; }   // defined in Geometry.cpp
 
 namespace ap::obj {
 

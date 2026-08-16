@@ -4,8 +4,79 @@
 #include <taskflow/algorithm/for_each.hpp>  // tf::FlowBuilder::for_each_index
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <limits>
+#include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
+
+// ---- texture-seam splitting table. Only this translation unit uses
+// it, so the whole machinery lives here instead of a shared header
+// (Geometry.h forward-declares SeamShard for its storage member). ----
+namespace ap::detail {
+
+struct SeamVert {
+    uint32_t v, vt, vn;   // pool indices; 0xFFFFFFFF = part absent
+};
+
+// Key = (v, vt, vn) split across two lanes (68 bits won't fit one u64)
+struct SeamShard {
+    std::mutex mx;
+    std::vector<uint64_t> keys0;   // vt | (vn << 32)
+    std::vector<uint32_t> keys1;   // v
+    std::vector<uint32_t> vals;    // output vertex; 0xFFFFFFFF = empty
+    std::vector<std::pair<uint32_t, SeamVert>> added;   // data for seamFill
+    size_t mask = 0;
+    size_t count = 0;
+
+    void seed(size_t slots) {
+        size_t s = 1024;
+        while (s < slots) s <<= 1;
+        keys0.assign(s, 0);
+        keys1.assign(s, 0);
+        vals.assign(s, 0xFFFFFFFFu);
+        mask = s - 1;
+        count = 0;
+    }
+    size_t probe(uint32_t v, uint64_t k0) const {
+        size_t i = size_t((k0 ^ (uint64_t(v) * 0x9E3779B97F4A7C15ull))
+                          >> 20) & mask;
+        while (vals[i] != 0xFFFFFFFFu
+               && !(keys1[i] == v && keys0[i] == k0))
+            i = (i + 1) & mask;
+        return i;
+    }
+    void grow() {   // caller holds mx
+        std::vector<uint64_t> o0 = std::move(keys0);
+        std::vector<uint32_t> o1 = std::move(keys1);
+        std::vector<uint32_t> ov = std::move(vals);
+        seed((mask + 1) * 2);
+        for (size_t i = 0; i < ov.size(); ++i) {
+            if (ov[i] == 0xFFFFFFFFu) continue;
+            const size_t j = probe(o1[i], o0[i]);
+            keys0[j] = o0[i];
+            keys1[j] = o1[i];
+            vals[j] = ov[i];
+            ++count;
+        }
+    }
+};
+
+// first writer claims the slot; a different value already there = seam
+bool claimIdx(uint32_t& slot, uint32_t val) {
+    std::atomic_ref<uint32_t> a(slot);
+    uint32_t cur = a.load(std::memory_order_relaxed);
+    for (;;) {
+        if (cur == val) return true;
+        if (cur != 0xFFFFFFFFu) return false;
+        if (a.compare_exchange_weak(cur, val, std::memory_order_relaxed))
+            return true;
+    }
+}
+
+} // namespace ap::detail
 
 namespace ap::obj {
 
@@ -18,6 +89,28 @@ struct RawGroup {
     uint32_t firstTriangle = 0;
     uint32_t triangleCount = 0;
 };
+
+// Split [0, size) into `n` byte ranges, each boundary snapped forward
+// to the next '\n' so a range never starts or ends mid-line (a partial
+// line at a boundary belongs to the earlier chunk). This is the unit
+// of work for chunk-parallel line scans over an mmap.
+std::vector<std::pair<size_t, size_t>> splitLineRanges(
+    const char* data, size_t size, size_t n) {
+    std::vector<std::pair<size_t, size_t>> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        size_t b = size * i / n;
+        size_t e = size * (i + 1) / n;
+        if (b > size) b = size;
+        // snap begin forward to the next line start
+        while (b > 0 && b < size && data[b - 1] != '\n') ++b;
+        // snap end forward to include the partial line
+        while (e < size && e > 0 && data[e - 1] != '\n') ++e;
+        if (e < b) e = b;
+        out.emplace_back(b, e);
+    }
+    return out;
+}
 
 } // namespace
 

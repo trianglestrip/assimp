@@ -60,7 +60,7 @@ constexpr uint32_t kBar    = 0xFF2E8B57;   // loading bar fill
 constexpr uint32_t kText   = 0xFF9A9A9A;
 constexpr uint32_t kColor0 = 0xFF8888A8;   // default mesh color (before materials)
 constexpr const char* kHudHelp =
-    "drag: orbit   wheel: zoom   WASD: move   Q/E: height   T: textures";
+    "drag orbit | wheel zoom | WASD move | Q/E height";
 
 // ---- window / loading overlay ----
 SDL_Window* g_win = nullptr;
@@ -202,7 +202,7 @@ static void initFonts() {
             f.atlas.data(), f.W, f.H, 32, 96, f.chars);
         f.ok = r > 0;
     };
-    bake(g_fontHud, 26.f);
+    bake(g_fontHud, 18.f);
     bake(g_fontBig, 36.f);
     AP_LOG("viewer", "font: %s (hud %s, big %s)", used,
            g_fontHud.ok ? "ok" : "off", g_fontBig.ok ? "ok" : "off");
@@ -256,12 +256,12 @@ static void fillRect(uint32_t* px, int bufW, int bufH,
             px[size_t(yy) * bufW + xx] = col;
 }
 
-// 960x80 ARGB text strip -> RGBA bytes, ready for the HUD upload
+// 960x64 ARGB text strip -> RGBA bytes, ready for the HUD upload
 static std::vector<unsigned char> rasterHud(const std::string& line1) {
-    std::vector<uint32_t> hud(size_t(kWinW) * 80, kBg);
-    drawTextTTF(hud.data(), kWinW, 80, g_fontHud, line1.c_str(), 14, 6,
+    std::vector<uint32_t> hud(size_t(kWinW) * 64, kBg);
+    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, line1.c_str(), 14, 6,
                 kText);
-    drawTextTTF(hud.data(), kWinW, 80, g_fontHud, kHudHelp, 14, 44, kText);
+    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, kHudHelp, 14, 30, kText);
     std::vector<unsigned char> rgba(hud.size() * 4);
     for (size_t p = 0; p < hud.size(); ++p) {
         const uint32_t col = hud[p];
@@ -700,7 +700,7 @@ int main(int argc, char** argv) {
                 // consumes completed results (dropping stale ones)
                 char info[256];
                 std::snprintf(info, sizeof info,
-                              "%s | %llu tris | %.1f fps | DX12 | Esc quit",
+                              "%s | %llu tris | %.1f fps",
                               g_modelName.c_str(),
                               (unsigned long long)g_meshTriStart.back(), fpsNow);
                 const std::string hudText(info);

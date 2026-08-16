@@ -1,16 +1,14 @@
 #pragma once
 // ============================================================
-// Misc - format-agnostic utilities shared by ModelParser
-// implementations: text tokenization over a memory mapping,
-// line-aligned chunk splitting for parallel scans, timing.
-// Everything here is header-only inline and allocation-light.
+// TextScan - format-agnostic text utilities shared by the ModelParser
+// implementations: tokenization over a memory mapping and the fast
+// number kernels. Header-only inline because the OBJ face walker
+// (forEachFaceVertex in Scan.h) is a template that inlines them.
 // ============================================================
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <utility>
-#include <vector>
 
 #include "FastParse.h"               // ap::fast number kernels
 
@@ -47,28 +45,6 @@ inline float parseFloat(const char* s, size_t n) {
 }
 inline int64_t parseInt(const char* s, size_t n) {
     return ap::fast::parseInt(s, n);
-}
-
-// Split [0, size) into `n` byte ranges, each boundary snapped forward
-// to the next '\n' so a range never starts or ends mid-line (a partial
-// line at a boundary belongs to the earlier chunk). This is the unit
-// of work for chunk-parallel line scans over an mmap.
-inline std::vector<std::pair<size_t, size_t>> splitLineRanges(
-    const char* data, size_t size, size_t n) {
-    std::vector<std::pair<size_t, size_t>> out;
-    out.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        size_t b = size * i / n;
-        size_t e = size * (i + 1) / n;
-        if (b > size) b = size;
-        // snap begin forward to the next line start
-        while (b > 0 && b < size && data[b - 1] != '\n') ++b;
-        // snap end forward to include the partial line
-        while (e < size && e > 0 && data[e - 1] != '\n') ++e;
-        if (e < b) e = b;
-        out.emplace_back(b, e);
-    }
-    return out;
 }
 
 } // namespace ap

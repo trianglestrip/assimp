@@ -633,7 +633,7 @@ float4 main(PSIn i) : SV_Target {
     // [kMaxTex+1]=HUD, [kMaxTex+2]=loading
     dx.white = dx.makeTex(1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                           D3D12_RESOURCE_STATE_COPY_DEST);
-    dx.hudTex = dx.makeTex(UINT(w), 80, DXGI_FORMAT_R8G8B8A8_UNORM,
+    dx.hudTex = dx.makeTex(UINT(w), 64, DXGI_FORMAT_R8G8B8A8_UNORM,
                            D3D12_RESOURCE_STATE_COPY_DEST);
     dx.loadTex = dx.makeTex(UINT(w), UINT(h), DXGI_FORMAT_R8G8B8A8_UNORM,
                             D3D12_RESOURCE_STATE_COPY_DEST);
@@ -943,7 +943,7 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
         const D3D12_SUBRESOURCE_DATA hd{hudRgba,
                                         LONG_PTR(size_t(dx.winW)) * 4,
-                                        LONG_PTR(size_t(dx.winW)) * 80 * 4};
+                                        LONG_PTR(size_t(dx.winW)) * 64 * 4};
         dx.upload->Upload(dx.hudTex.Get(), 0, &hd, 1);
         dx.upload->Transition(dx.hudTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -951,7 +951,7 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
     }
     if (dx.hudReady) {
         dx.sprites->Begin(dx.list.Get());
-        dx.sprites->Draw(dx.hudGpu, XMUINT2(UINT(dx.winW), 80),
+        dx.sprites->Draw(dx.hudGpu, XMUINT2(UINT(dx.winW), 64),
                          XMFLOAT2(0.f, 0.f));
         dx.sprites->End();
     }
