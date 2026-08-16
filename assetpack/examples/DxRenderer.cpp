@@ -1,6 +1,9 @@
 #include "DxRenderer.h"
 #include <assetpack/AssetPack.h>
 
+#include "imgui.h"
+#include "imgui_impl_dx12.h"
+
 #include <SDL2/SDL_syswm.h>
 
 #include <d3d12.h>
@@ -141,12 +144,18 @@ struct DxRenderer::Impl {
     D3D12_INDEX_BUFFER_VIEW ibv{};
 
     // overlay + texture SRV table: [0]=white, [1..]=textures,
-    // [kMaxTex+1]=HUD, [kMaxTex+2]=loading
-    ComPtr<ID3D12Resource> white, hudTex, loadTex;
-    D3D12_GPU_DESCRIPTOR_HANDLE whiteGpu{}, hudGpu{}, loadGpu{};
-    bool hudReady = false, loadReady = false;
+    // [kMaxTex+1]=loading
+    ComPtr<ID3D12Resource> white, loadTex;
+    D3D12_GPU_DESCRIPTOR_HANDLE whiteGpu{}, loadGpu{};
+    bool loadReady = false;
     std::vector<ComPtr<ID3D12Resource>> texRes;
     std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> texGpu;
+
+    // ImGui overlay: the backend needs a GPU-visible SRV heap it fully
+    // owns (fonts + one descriptor per frame); separate from srvHeap
+    ComPtr<ID3D12DescriptorHeap> imguiHeap;
+    UINT imguiSrvSize = 0;
+    UINT imguiNextDesc = 0;
 
     // profile
     uint64_t frames = 0;
@@ -264,14 +273,35 @@ struct DxRenderer::Impl {
         return f;
     }
 
-    // ---- frame epilogue: resolve the MSAA target, submit, present ----
+    // ---- frame epilogue: resolve the MSAA target, draw the ImGui
+    // overlay on the resolved back buffer, submit, present ----
     void endFrame(UINT f, const char* shotPath) {
         barrier(msaaRT.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
         list->ResolveSubresource(back[f].Get(), 0, msaaRT.Get(), 0,
                                  DXGI_FORMAT_R8G8B8A8_UNORM);
+
+        // ImGui's PSO is 1x MSAA, so the overlay cannot share the MSAA
+        // target: draw it here, on the resolved back buffer, between the
+        // resolve and the present barrier. The viewer calls NewFrame/
+        // Render each scene frame; RenderDrawData only executes when a
+        // frame was built (imguiReady guards the uninitialized case).
+        D3D12_RESOURCE_STATES backState = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        if (imguiHeap && ImGui::GetCurrentContext() &&
+            ImGui::GetDrawData() != nullptr) {
+            barrier(back[f].Get(), backState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const UINT rtvSize = dev->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            D3D12_CPU_DESCRIPTOR_HANDLE backRtv =
+                rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            backRtv.ptr += SIZE_T(f) * rtvSize;
+            list->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
+            ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), list.Get());
+            backState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+
         if (shotPath) {
-            barrier(back[f].Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+            barrier(back[f].Get(), backState,
                     D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_TEXTURE_COPY_LOCATION dst{};
             dst.pResource = readback.Get();
@@ -288,8 +318,7 @@ struct DxRenderer::Impl {
             barrier(back[f].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_PRESENT);
         } else {
-            barrier(back[f].Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT);
+            barrier(back[f].Get(), backState, D3D12_RESOURCE_STATE_PRESENT);
         }
 
         // flush this frame's uploads BEFORE the frame list executes (the
@@ -630,11 +659,9 @@ float4 main(PSIn i) : SV_Target {
         return false;
 
     // overlays + SRV table: [0]=white, [1..kMaxTex]=textures,
-    // [kMaxTex+1]=HUD, [kMaxTex+2]=loading
+    // [kMaxTex+1]=loading
     dx.white = dx.makeTex(1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                           D3D12_RESOURCE_STATE_COPY_DEST);
-    dx.hudTex = dx.makeTex(UINT(w), 64, DXGI_FORMAT_R8G8B8A8_UNORM,
-                           D3D12_RESOURCE_STATE_COPY_DEST);
     dx.loadTex = dx.makeTex(UINT(w), UINT(h), DXGI_FORMAT_R8G8B8A8_UNORM,
                             D3D12_RESOURCE_STATE_COPY_DEST);
     const D3D12_CPU_DESCRIPTOR_HANDLE srvBase =
@@ -647,10 +674,6 @@ float4 main(PSIn i) : SV_Target {
     D3D12_GPU_DESCRIPTOR_HANDLE g = srvGpuBase;
     c.ptr += (kMaxTex + 1) * SIZE_T(dx.srvSize);
     g.ptr += (kMaxTex + 1) * dx.srvSize;
-    dx.srv(dx.hudTex.Get(), c);
-    dx.hudGpu = g;
-    c.ptr += dx.srvSize;
-    g.ptr += dx.srvSize;
     dx.srv(dx.loadTex.Get(), c);
     dx.loadGpu = g;
 
@@ -683,6 +706,52 @@ float4 main(PSIn i) : SV_Target {
     dx.upload->End(dx.queue.Get()).wait();   // needed before the first frame
     dx.uploadOpen = false;
 
+    // ---- ImGui overlay (DX12 backend) ----
+    // The backend draws onto the resolved back buffer (its PSO is 1x
+    // MSAA) and needs a GPU-visible SRV heap it fully owns for the font
+    // atlas plus one descriptor per in-flight frame. ImGui context and
+    // the SDL2 platform backend are set up by the viewer before this
+    // call; here we only wire the render side.
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 64;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(dx.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dx.imguiHeap)))) {
+            AP_LOG_WARN("dx", "ImGui SRV heap creation failed");
+        } else {
+            dx.imguiSrvSize = dx.dev->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            ImGui_ImplDX12_InitInfo ii{};
+            ii.Device = dx.dev.Get();
+            ii.CommandQueue = dx.queue.Get();
+            ii.NumFramesInFlight = kBackBuffers;
+            ii.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+            ii.DSVFormat = DXGI_FORMAT_UNKNOWN;
+            ii.SrvDescriptorHeap = dx.imguiHeap.Get();
+            ii.SrvDescriptorAllocFn =
+                [](ImGui_ImplDX12_InitInfo* info,
+                   D3D12_CPU_DESCRIPTOR_HANDLE* cpu,
+                   D3D12_GPU_DESCRIPTOR_HANDLE* gpu) {
+                    auto& d = *static_cast<DxRenderer::Impl*>(info->UserData);
+                    const SIZE_T off =
+                        SIZE_T(d.imguiNextDesc++) * d.imguiSrvSize;
+                    *cpu = d.imguiHeap->GetCPUDescriptorHandleForHeapStart();
+                    cpu->ptr += off;
+                    *gpu = d.imguiHeap->GetGPUDescriptorHandleForHeapStart();
+                    gpu->ptr += off;
+                };
+            ii.SrvDescriptorFreeFn =
+                [](ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE,
+                   D3D12_GPU_DESCRIPTOR_HANDLE) {};
+            ii.UserData = &dx;
+            if (!ImGui_ImplDX12_Init(&ii))
+                AP_LOG_WARN("dx", "ImGui DX12 backend init failed");
+            else
+                AP_LOG("dx", "ImGui DX12 backend ready");
+        }
+    }
+
     up_ = true;
     AP_LOG("dx", "ready: %dx%d swapchain, %u back buffers", w, h, kBackBuffers);
     return true;
@@ -698,6 +767,8 @@ void DxRenderer::shutdown() {
         dx.upload->End(dx.queue.Get()).wait();
         dx.uploadOpen = false;
     }
+    if (dx.imguiHeap)
+        ImGui_ImplDX12_Shutdown();
     dx.sprites.reset();
     dx.gfxMem.reset();
     dx.upload.reset();
@@ -709,7 +780,6 @@ void DxRenderer::shutdown() {
     dx.vbUv.Reset();
     dx.ib.Reset();
     dx.white.Reset();
-    dx.hudTex.Reset();
     dx.loadTex.Reset();
     dx.readback.Reset();
     dx.texRes.clear();
@@ -724,6 +794,7 @@ void DxRenderer::shutdown() {
     dx.rtvHeap.Reset();
     dx.dsvHeap.Reset();
     dx.srvHeap.Reset();
+    dx.imguiHeap.Reset();
     dx.dev.Reset();
     impl_.reset();
     up_ = false;
@@ -851,8 +922,7 @@ void DxRenderer::drawLoading(const uint32_t* argb) {
 
 void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
                            const texp::DecodedTex* texs, size_t texTotal,
-                           size_t texBudget, const unsigned char* hudRgba,
-                           const char* shotPath) {
+                           size_t texBudget, const char* shotPath) {
     if (!up_ || !psoUp_) return;
     Impl& dx = *impl_;
     const auto t0 = std::chrono::steady_clock::now();
@@ -933,28 +1003,8 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
         dx.list->DrawIndexedInstanced(it.indexCount, 1, it.startIndex, 0, 0);
     }
 
-    // HUD strip (native 960x80, drawn 1:1 - no vertical stretch); the
-    // viewer only passes pixels when the text changed, otherwise the SRV
-    // is reused
-    if (hudRgba) {
-        if (dx.hudReady)
-            dx.upload->Transition(dx.hudTex.Get(),
-                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                  D3D12_RESOURCE_STATE_COPY_DEST);
-        const D3D12_SUBRESOURCE_DATA hd{hudRgba,
-                                        LONG_PTR(size_t(dx.winW)) * 4,
-                                        LONG_PTR(size_t(dx.winW)) * 64 * 4};
-        dx.upload->Upload(dx.hudTex.Get(), 0, &hd, 1);
-        dx.upload->Transition(dx.hudTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        dx.hudReady = true;
-    }
-    if (dx.hudReady) {
-        dx.sprites->Begin(dx.list.Get());
-        dx.sprites->Draw(dx.hudGpu, XMUINT2(UINT(dx.winW), 64),
-                         XMFLOAT2(0.f, 0.f));
-        dx.sprites->End();
-    }
+    // (the ImGui overlay is drawn inside endFrame, after the MSAA
+    // resolve, so the 1x-MSAA ImGui PSO has a compatible target)
 
     dx.endFrame(f, shotPath);
     ++dx.frames;

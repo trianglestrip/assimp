@@ -1,8 +1,10 @@
 // assetpack_viewer - DX12-GPU-only viewer. Parser events feed texp::TexPipeline
 // (TexPipeline.h), the parallel mmap + stb_image texture decode, and DxRenderer
 // (DxRenderer.h), which owns the device, swapchain, scene PSO and the
-// DirectXTK12 display layer. Overlays (HUD strip, loading frame) rasterize
-// on a taskflow executor and upload as textures.
+// DirectXTK12 display layer. The loading overlay (progress bar + caption)
+// rasterizes on a taskflow executor and uploads as a texture; the in-game
+// stats overlay is Dear ImGui (third_party/imgui), drawn by DxRenderer after
+// the MSAA resolve.
 //
 // Usage:  assetpack_viewer [model.obj] [--frames N] [--wait]
 //                          [--shot N file.bmp] [--untex] [--warp]
@@ -12,7 +14,7 @@
 // then materials (diffuse colors), then textures (decoded in parallel with
 // stb_image and applied via uv sampling).
 //
-// Keys: Esc quit | T textures on/off
+// Keys: Esc quit | T textures on/off (when the overlay doesn't take them)
 // Mouse: drag = orbit | wheel = zoom
 // WASD: move along the view axis / strafe | Q/E: camera height
 
@@ -22,6 +24,10 @@
 
 #include "TexPipeline.h"     // parallel texture decode (mmap + stb_image)
 #include "DxRenderer.h"      // D3D12 backend (device, PSOs, uploads)
+
+#include <imgui.h>
+#include <imgui_impl_dx12.h>
+#include <imgui_impl_sdl2.h>
 
 #include <taskflow/taskflow.hpp>   // display-side CPU jobs run as tasks too
 
@@ -59,26 +65,22 @@ constexpr uint32_t kSlot   = 0xFF2E2E2E;   // loading bar slot
 constexpr uint32_t kBar    = 0xFF2E8B57;   // loading bar fill
 constexpr uint32_t kText   = 0xFF9A9A9A;
 constexpr uint32_t kColor0 = 0xFF8888A8;   // default mesh color (before materials)
-constexpr const char* kHudHelp =
-    "drag orbit | wheel zoom | WASD move | Q/E height";
 
 // ---- window / loading overlay ----
 SDL_Window* g_win = nullptr;
 
-// display-side taskflow: HUD/loading rasterization runs here so the
+// display-side taskflow: loading overlay rasterization runs here so the
 // render thread never pays the text rasterization or swizzle on its
 // critical path (one worker pool for the viewer's whole lifetime)
 tf::Executor g_tf;
 
-// latest-completed handoff for the two overlays: a task rasterizes into
-// a private buffer and parks it here; the render loop consumes (moves)
-// it, so stale results are dropped and the pointer stays owned through
-// the GPU upload of that frame
+// latest-completed handoff for the loading overlay: a task rasterizes
+// into a private buffer and parks it here; the render loop consumes
+// (moves) it, so stale results are dropped and the pointer stays owned
+// through the GPU upload of that frame
 std::mutex g_ovlMx;
-std::shared_ptr<std::vector<unsigned char>> g_hudLatest;
 std::shared_ptr<std::vector<uint32_t>> g_loadLatest;
-std::atomic<bool> g_hudBusy{false}, g_loadBusy{false};
-std::string g_hudSubmitted;
+std::atomic<bool> g_loadBusy{false};
 int g_loadPct = -1;
 
 // ---- parser event data (spans point into parser-owned pools) ----
@@ -164,7 +166,7 @@ static std::string msStr(double v) {
 
 // overlay rasterization, run as g_tf tasks (off the render thread):
 
-// ---- TrueType text (Consolas): two baked glyph atlases ---------------
+// ---- TrueType text (Consolas): one baked glyph atlas, loading caption ---
 struct BakedFont {
     bool ok = false;
     std::vector<unsigned char> atlas;   // 8-bit alpha
@@ -172,7 +174,7 @@ struct BakedFont {
     float ascent = 0.f;                 // pixels above the baseline
     stbtt_bakedchar chars[96];
 };
-static BakedFont g_fontHud, g_fontBig;
+static BakedFont g_fontBig;
 
 static void initFonts() {
     const char* candidates[] = {
@@ -206,10 +208,9 @@ static void initFonts() {
         // baseline, not the line top); ~0.8 * em for typical fonts
         f.ascent = px * 0.8f;
     };
-    bake(g_fontHud, 18.f);
     bake(g_fontBig, 36.f);
-    AP_LOG("viewer", "font: %s (hud %s, big %s)", used,
-           g_fontHud.ok ? "ok" : "off", g_fontBig.ok ? "ok" : "off");
+    AP_LOG("viewer", "font: %s (loading %s)", used,
+           g_fontBig.ok ? "ok" : "off");
 }
 
 // alpha-blend baked glyphs onto an ARGB buffer; y = top of the line
@@ -260,23 +261,6 @@ static void fillRect(uint32_t* px, int bufW, int bufH,
             px[size_t(yy) * bufW + xx] = col;
 }
 
-// 960x64 ARGB text strip -> RGBA bytes, ready for the HUD upload
-static std::vector<unsigned char> rasterHud(const std::string& line1) {
-    std::vector<uint32_t> hud(size_t(kWinW) * 64, kBg);
-    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, line1.c_str(), 14, 10,
-                kText);
-    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, kHudHelp, 14, 38, kText);
-    std::vector<unsigned char> rgba(hud.size() * 4);
-    for (size_t p = 0; p < hud.size(); ++p) {
-        const uint32_t col = hud[p];
-        rgba[4 * p] = unsigned char(col >> 16);
-        rgba[4 * p + 1] = unsigned char(col >> 8);
-        rgba[4 * p + 2] = unsigned char(col);
-        rgba[4 * p + 3] = 255;
-    }
-    return rgba;
-}
-
 // full-window loading frame (ARGB), bar + caption at the given percent
 static std::vector<uint32_t> rasterLoading(int pctI) {
     std::vector<uint32_t> px(size_t(kWinW) * size_t(kWinH), kBg);
@@ -304,6 +288,32 @@ static std::vector<uint32_t> rasterLoading(int pctI) {
                     float((kWinW - int(wq)) / 2), float(by - 56), kText);
     }
     return px;
+}
+
+// in-game stats overlay: Dear ImGui (DxRenderer draws it after the MSAA
+// resolve). One auto-sized window, rebuilt every frame.
+static void buildUi(double fpsNow) {
+    ImGui::SetNextWindowPos(ImVec2(10, 8), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("stats", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoSavedSettings);
+    ImGui::TextUnformatted(g_modelName.c_str());
+    if (g_allDone.load()) {
+        ImGui::Text("%llu tris | %.1f fps",
+                    (unsigned long long)g_meshTriStart.back(), fpsNow);
+        ImGui::Text("import %.1f ms | total %.1f ms", g_importMs, g_totalMs);
+    } else {
+        ImGui::ProgressBar(g_progress.load() / 100.f, ImVec2(-1.f, 0.f), "");
+    }
+    if (g_texPipe.count() > 0)
+        ImGui::Text("%zu textures%s", g_texPipe.count(),
+                    g_noTex.load() ? " (off)" : "");
+    ImGui::Separator();
+    ImGui::TextDisabled(
+        "drag orbit | wheel zoom | WASD move | Q/E height | T tex | Esc quit");
+    ImGui::End();
 }
 
 // ============================================================
@@ -567,6 +577,11 @@ int main(int argc, char** argv) {
         SDL_Quit();
         return 1;
     }
+    // Dear ImGui context + SDL2 backend first: DxRenderer::init calls
+    // ImGui_ImplDX12_Init and needs the context to exist
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui_ImplSDL2_InitForD3D(g_win);
     g_dx = std::make_unique<DxRenderer>();
     if (!g_dx->init(g_win, kWinW, kWinH, g_forceWarp)) {
         std::fprintf(stderr, "DX12 init failed\n");
@@ -588,10 +603,12 @@ int main(int argc, char** argv) {
         size_t texReleasedUpTo = 0;   // decoded slots freed after GPU upload
         while (!g_quit.load()) {
             SDL_Event e;
+            const ImGuiIO& io = ImGui::GetIO();
             while (SDL_PollEvent(&e)) {
+                ImGui_ImplSDL2_ProcessEvent(&e);
                 if (e.type == SDL_QUIT) {
                     g_quit.store(true);
-                } else if (e.type == SDL_KEYDOWN) {
+                } else if (e.type == SDL_KEYDOWN && !io.WantCaptureKeyboard) {
                     switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE: g_quit.store(true); break;
                     case SDLK_t: {
@@ -602,7 +619,8 @@ int main(int argc, char** argv) {
                     }
                     default: break;
                     }
-                } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                } else if (e.type == SDL_MOUSEBUTTONDOWN &&
+                           !io.WantCaptureMouse) {
                     if (e.button.button == SDL_BUTTON_LEFT)
                         g_dragging = true;
                 } else if (e.type == SDL_MOUSEBUTTONUP) {
@@ -615,7 +633,8 @@ int main(int argc, char** argv) {
                         if (g_pitch > 1.4f) g_pitch = 1.4f;
                         if (g_pitch < -1.4f) g_pitch = -1.4f;
                     }
-                } else if (e.type == SDL_MOUSEWHEEL) {
+                } else if (e.type == SDL_MOUSEWHEEL &&
+                           !io.WantCaptureMouse) {
                     g_camDist *= std::pow(0.9f, float(e.wheel.y));
                     if (g_camDist < 0.15f) g_camDist = 0.15f;
                     if (g_camDist > 10.0f) g_camDist = 10.0f;
@@ -623,15 +642,28 @@ int main(int argc, char** argv) {
             }
             // WASD: move along the view axis (W/S) and strafe (A/D);
             // Q/E: raise/lower the camera in world space; the step scales
-            // with the current zoom distance (halved for finer control)
-            const Uint8* ks = SDL_GetKeyboardState(nullptr);
-            const float step = 0.01f * g_camDist;
-            if (ks[SDL_SCANCODE_W]) g_offZ -= step;
-            if (ks[SDL_SCANCODE_S]) g_offZ += step;
-            if (ks[SDL_SCANCODE_A]) g_offX += step;
-            if (ks[SDL_SCANCODE_D]) g_offX -= step;
-            if (ks[SDL_SCANCODE_Q]) g_offY -= step;
-            if (ks[SDL_SCANCODE_E]) g_offY += step;
+            // with the current zoom distance (halved for finer control).
+            // Held keys are ignored while the ImGui overlay owns them
+            if (!io.WantCaptureKeyboard) {
+                const Uint8* ks = SDL_GetKeyboardState(nullptr);
+                const float step = 0.01f * g_camDist;
+                if (ks[SDL_SCANCODE_W]) g_offZ -= step;
+                if (ks[SDL_SCANCODE_S]) g_offZ += step;
+                if (ks[SDL_SCANCODE_A]) g_offX += step;
+                if (ks[SDL_SCANCODE_D]) g_offX -= step;
+                if (ks[SDL_SCANCODE_Q]) g_offY -= step;
+                if (ks[SDL_SCANCODE_E]) g_offY += step;
+            }
+
+            // ImGui frame: the render data is consumed by DxRenderer's
+            // endFrame pass (drawn after the MSAA resolve). The DX12
+            // backend's NewFrame also creates its device objects (PSOs,
+            // the texture-upload command list) on the first call.
+            ImGui_ImplDX12_NewFrame();
+            ImGui_ImplSDL2_NewFrame();
+            ImGui::NewFrame();
+            buildUi(fpsNow);
+            ImGui::Render();
 
             // stage the parser pools once (idempotent) as soon as they
             // exist. With the corrected +y-up NDC the view-space CCW
@@ -699,40 +731,12 @@ int main(int argc, char** argv) {
                     items.push_back(it);
                 }
 
-                // HUD: text into a 960x80 strip, rasterized on the
-                // taskflow when the text changes; the render thread only
-                // consumes completed results (dropping stale ones)
-                char info[256];
-                std::snprintf(info, sizeof info,
-                              "%s | %llu tris | %.1f fps",
-                              g_modelName.c_str(),
-                              (unsigned long long)g_meshTriStart.back(), fpsNow);
-                const std::string hudText(info);
-                if (hudText != g_hudSubmitted && !g_hudBusy.exchange(true)) {
-                    g_hudSubmitted = hudText;
-                    g_tf.async([t = hudText]() {
-                        auto rgba = std::make_shared<std::vector<unsigned char>>(
-                            rasterHud(t));
-                        {
-                            const std::lock_guard<std::mutex> lk(g_ovlMx);
-                            g_hudLatest = std::move(rgba);
-                        }
-                        g_hudBusy.store(false);
-                    });
-                }
-                std::shared_ptr<std::vector<unsigned char>> hud;
-                {
-                    const std::lock_guard<std::mutex> lk(g_ovlMx);
-                    hud = std::move(g_hudLatest);
-                }
-
                 // drawScene consumes g_dxShotNext; the frame after the shot
                 // request is captured (content is identical: static camera
                 // between frames)
                 g_dx->drawScene(cam, items, g_texPipe.data(), g_texPipe.count(),
-                                32, hud ? hud->data() : nullptr,
-                                g_dxShotNext.empty() ? nullptr
-                                                     : g_dxShotNext.c_str());
+                                32, g_dxShotNext.empty() ? nullptr
+                                                         : g_dxShotNext.c_str());
                 g_dxShotNext.clear();
                 // ResourceUploadBatch::End copies the sources into its
                 // staging buffers synchronously, so once the frame is
@@ -763,7 +767,9 @@ int main(int argc, char** argv) {
                (unsigned long long)framesAll, fpsNow);
     }
 
-    g_dx.reset();
+    g_dx.reset();                // ImGui_ImplDX12_Shutdown inside
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext();
     SDL_DestroyWindow(g_win);
     SDL_Quit();
     AP_LOG("viewer", "bye");

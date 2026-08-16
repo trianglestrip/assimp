@@ -53,6 +53,25 @@ if(ASSETPACK_WITH_VIEWER)
         message(FATAL_ERROR "ASSETPACK_WITH_VIEWER=ON but SDL2 not found at SDL2_ROOT=${SDL2_ROOT}")
     endif()
 
+    # Dear ImGui: immediate-mode UI, vendored under third_party/ and built
+    # as a static library. Only the SDL2 + DX12 backends are compiled; the
+    # other backend files in the tree are inert. The DX12 backend needs
+    # d3dcompiler at link time (it compiles its shaders with D3DCompile).
+    add_library(imgui STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/imgui.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/imgui_widgets.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_dx12.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_sdl2.cpp)
+    target_include_directories(imgui PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
+        ${SDL2_ROOT}/include)
+    target_compile_features(imgui PUBLIC cxx_std_20)
+    target_link_libraries(imgui PUBLIC d3d12 dxgi d3dcompiler
+        "${SDL2_ROOT}/lib/x64/SDL2.lib")
+
     add_executable(assetpack_viewer examples/viewer_demo.cpp
                              examples/TexPipeline.cpp
                              examples/DxRenderer.cpp)
@@ -67,7 +86,7 @@ if(ASSETPACK_WITH_VIEWER)
     set(BUILD_DXIL_SHADERS OFF CACHE BOOL "" FORCE)   # this machine has fxc, not dxc
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/DirectXTK12
                      ${CMAKE_CURRENT_BINARY_DIR}/DirectXTK12)
-    target_link_libraries(assetpack_viewer PRIVATE assetpack DirectXTK12
+    target_link_libraries(assetpack_viewer PRIVATE assetpack imgui DirectXTK12
         "${SDL2_ROOT}/lib/x64/SDL2.lib" "${SDL2_ROOT}/lib/x64/SDL2main.lib"
         d3d12 dxgi d3dcompiler)
     target_compile_definitions(assetpack_viewer PRIVATE SDL_MAIN_HANDLED NOMINMAX)

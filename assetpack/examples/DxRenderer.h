@@ -62,12 +62,12 @@ public:
 
     // scene frame: camera constants (see the viewer for the layout),
     // one DrawItem per mesh, decoded textures (a bounded chunk uploads
-    // per frame), optional HUD strip (w * 40 RGBA bytes, null =
-    // unchanged), optional screenshot path (captured this frame)
+    // per frame), optional screenshot path (captured this frame). The
+    // ImGui overlay (built by the viewer) is drawn after the MSAA
+    // resolve, inside this call.
     void drawScene(const float cam[16], std::span<const DrawItem> items,
                    const texp::DecodedTex* texs, size_t texTotal,
-                   size_t texBudget, const unsigned char* hudRgba,
-                   const char* shotPath);
+                   size_t texBudget, const char* shotPath);
 
     bool ready() const { return up_; }
     bool geometryReady() const { return psoUp_; }
