@@ -163,6 +163,23 @@ depth prepass（过绘制场景的 PS 减负，双倍 draw 数）。60 fps 之�
 cpu/gpu/scene/ovl/wait/record 写入 `stat/<标签>.csv`；浏览器打开
 `tools/stat_plot.html` 多选 CSV 即可叠加折线对比不同优化版本。
 
+**相机视角 1% low 测试**（`--autoRotate` 每帧绕 Y 轴转 0.01 rad ≈ 10 s
+一圈，`--camDist <v>` 覆盖初始距离，可 < 0.15 滚轮下限以放进模型内部）
+验证"视角是否影响瓶颈结论"：San Miguel 相机放模型内部（dist 0.15）
+与外部远距（dist 2.2）各自动旋转 600 帧，稳态 1% low（最慢 1% 帧均值）：
+
+| 视角 | GPU avg | GPU 1%low | GPU P99 | CPU 1%low |
+| --- | ---: | ---: | ---: | ---: |
+| 内部旋转 (0.15) | 4.13 ms | 5.16 ms | 5.05 ms | 19.6 ms |
+| 外部旋转 (2.2) | 4.28 ms | 5.10 ms | 5.05 ms | 18.7 ms |
+
+GPU 最差帧仅 5.2 ms（占 16.7 ms 帧预算 31%），两个视角几乎无差别
+（外部 avg 略高：远距看到整个建筑外立面，近距被 near plane 裁掉
+一部分三角形），1% low 完全落在合成器节奏内——GPU 在任何视角都
+不是瓶颈。CPU 1% low ~19 ms 的尖峰帧构成：wait_ms 反而低（6.8–
+11.7 ms）、record 恒定 ~3.1 ms，即尖峰来自 DWM 合成器节拍抖动，
+与场景负载无关。
+
 ## PIX 分析（程序化抓帧 + 命令行导出）
 
 viewer 集成了 WinPixEventRuntime（vendored 到 `third_party/pix`，

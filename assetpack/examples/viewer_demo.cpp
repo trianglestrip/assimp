@@ -113,6 +113,7 @@ bool g_dragging = false;                   // left-button orbit in progress
 float g_offX = 0.f, g_offZ = 0.f;          // WASD view-space offsets
 float g_offY = 0.f;                        // Q/E world-space camera height
 bool g_cullFrontZ = true;                  // true: CCW front faces have +z winding
+bool g_autoRotate = false;                 // --autoRotate: orbit yaw each frame
 
 // parser pool pointers captured at onVerticesReady (the pack outlives the
 // frame loop, so they stay valid); DxRenderer stages its geometry straight
@@ -662,6 +663,10 @@ int main(int argc, char** argv) {
             g_pixPath = argv[++i];    // programmatic GPU capture target
         } else if (a == "--pixStart" && i + 1 < argc) {
             g_pixStartFrame = std::atoi(argv[++i]);   // skip warm-up frames
+        } else if (a == "--autoRotate") {
+            g_autoRotate = true;          // orbit the model each frame
+        } else if (a == "--camDist" && i + 1 < argc) {
+            g_camDist = float(std::atof(argv[++i]));   // allow < 0.15 (inside)
         } else if (a.rfind("--", 0) != 0) {
             model = a;
         } else {
@@ -842,6 +847,9 @@ int main(int argc, char** argv) {
                 // camera constants: identical math to the software
                 // transform this viewer used to have (the vertex shader
                 // mirrors the layout)
+                if (g_autoRotate) {
+                    g_rotY += 0.01f;      // ~10 s per full orbit at 60 fps
+                }
                 const float cY = std::cos(g_rotY), sY = std::sin(g_rotY);
                 const float cP = std::cos(g_pitch), sP = std::sin(g_pitch);
                 const float f = float(kWinH) * 0.5f / 0.5773503f;
