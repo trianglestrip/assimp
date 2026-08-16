@@ -109,6 +109,21 @@ void ModelParser::fireProgress(float pct) const {
     if (onProgress_) onProgress_(pct);
 }
 
+// Pools are shared state: clearing them here covers every parser. The
+// consumer must have copied what it needs (e.g. uploaded to the GPU)
+// and must not hold PackMesh pool views - only mesh metadata survives.
+void ModelParser::releaseGeometry() {
+    if (!result_) return;
+    result_->positions.clear();
+    result_->positions.shrink_to_fit();
+    result_->normals.clear();
+    result_->normals.shrink_to_fit();
+    result_->texcoords.clear();
+    result_->texcoords.shrink_to_fit();
+    result_->posIndices.clear();
+    result_->posIndices.shrink_to_fit();
+}
+
 // ---- AssetPack facade ----
 
 AssetPack::AssetPack(unsigned threads)
@@ -167,5 +182,9 @@ void AssetPack::loadAsync(std::string_view path) {
 }
 
 PackResult& AssetPack::result() { return parser_->result(); }
+
+void AssetPack::releaseGeometry() {
+    if (parser_) parser_->releaseGeometry();
+}
 
 } // namespace ap

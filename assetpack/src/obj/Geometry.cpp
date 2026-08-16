@@ -225,10 +225,11 @@ void GeometryStage::run(tf::Subflow& sf) {
         uvPool->resize(u * 2);
         // per-vertex vn/vt reference slots; 0xFFFFFFFF marks "no
         // reference yet" so unreferenced vertices keep zero normals.
-        // vnIdx stays empty when normals are not wanted; pass 2's
-        // store and pass 3's expansion both turn off on that.
+        // vnIdx stays empty when normals are not wanted; uvIdx stays
+        // empty when the file has no vt at all - pass 2's claim and
+        // pass 3's expansion both already guard on empty()
         if (wantN) vnIdx->assign(p, 0xFFFFFFFFu);
-        uvIdx->assign(p, 0xFFFFFFFFu);
+        if (u) uvIdx->assign(p, 0xFFFFFFFFu);
         // expansion targets (per-vertex indexed, filled by pass 3)
         if (wantN && n) result->normals.assign(p * 3, 0.f);
         if (u) result->texcoords.assign(p * 2, 0.f);

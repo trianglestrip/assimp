@@ -201,8 +201,34 @@ GPU 最差帧仅 5.2 ms（占 16.7 ms 帧预算 31%），两个视角几乎无�
   只有三角形量上亿后 GPU 才饱和。CPU 录制反而降到 0.74 ms
   （平铺后 513 draws < San Miguel 2203）。
 - 解析超线性（9× 数据 → 冷 33×/热 16× 耗时）：8.5 GB mmap +
-  2.5 GB 池在 16 GB 内存机上页缓存驻留不足 + 内存带宽饱和，
+  3.3 GB 池在 16 GB 内存机上页缓存驻留不足 + 内存带宽饱和，
   非算法退化（12.7M 时 340 ms 内联近线性）。
+
+**针对超出内存场景的解析内存优化**（x9 实测，全部数字来自同一
+16 GB 内存机，PowerShell 逐 150 ms 采样私有内存）：
+
+- 优化前池账目（与实测 3.26 GB 峰值一致）：positions 646 MB +
+  posIndices 1.38 GB + normals 646 MB + vnIdx 215 MB + uvIdx
+  215 MB（无 vt 的文件也分配）+ vnPool 86 MB。
+- 三项优化：
+  1. `setWantNormals(false)`：viewer 场景 shader 只读 pos+uv，
+     解析时跳过 normals/vnIdx/vnPool（省 947 MB）；
+  2. `uvIdx` 按需分配：文件无 `vt` 行时不再分配 uvIdx（省
+     215 MB）；
+  3. `releaseGeometry()`（新接口）：`setGeometry` 的
+     `ResourceUploadBatch::Upload` 是同步拷进 staging，返回后
+     CPU 池即死重，上传完成立即释放 positions+posIndices
+     （省 2 GB）。
+- 实测（powerplant_x9，114.8M tris）：解析期私有内存峰值
+  **3.26 → 2.15 GB（−34%）**，渲染稳态私有内存 **5.61 →
+  2.56 GB（−54%）**，稳态工作集 7.4 → 6.1 GB；渲染无回归
+  （GPU scene 20.7–20.8 ms 不变）。San Miguel 贴图路径验证：
+  wantNormals(false) 下 UV/纹理照常（1117/2203 绑定、0 失败），
+  截图与优化前逐像素一致。
+- 语义：`releaseGeometry()` 后 PackMesh 的池视图悬空，只保留
+  网格元数据（bounds/材质/三角形数）；材质名/贴图路径等
+  string_view 仍指向 mmap，因此 mmap 不释放（8.5 GB 映射只占
+  地址空间，页缓存随访问自然淘汰）。
 - 复现：`assetpack_viewer --wait --frames 300 --autoRotate --stat x9
   F:/project/meshToBrowser/models/powerplant_x9.obj`；平铺生成脚本
   `models/tile_powerplant.py`（step1 负索引转绝对、step2 网格复制

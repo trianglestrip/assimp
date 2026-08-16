@@ -712,6 +712,10 @@ int main(int argc, char** argv) {
     {
         ap::AssetPack pack;              // outlives the frame loop; its
         bindEvents(pack);                // destructor drains the executor
+        // the scene shader lights nothing: it needs only pos+uv, so
+        // skipping the per-vertex normal expansion saves up to ~3/8 of
+        // the geometry pool (normals + vn refs) on big models
+        pack.setWantNormals(false);
         pack.loadAsync(model);
 
         std::optional<Clock::time_point> tAll;
@@ -789,9 +793,16 @@ int main(int argc, char** argv) {
             // exist. With the corrected +y-up NDC the view-space CCW
             // front side stays CCW on screen; the old negated Y scale
             // mirrored winding, so this flag flipped with it
-            if (g_vertsReady.load() && g_posPool && !g_dx->geometryReady())
+            if (g_vertsReady.load() && g_posPool && !g_dx->geometryReady()) {
                 g_dx->setGeometry(g_posPool, g_poolVerts, g_uvPool, g_idxPool,
                                   g_idxCount, g_cullFrontZ);
+                // setGeometry copies the pools into GPU upload buffers
+                // synchronously; the CPU-side pools (~2 GB on the big
+                // tiled model) are dead weight once the upload returned.
+                // This also drops the parse-time peak before the steady
+                // frame loop starts.
+                pack.releaseGeometry();
+            }
             if (!g_vertsReady.load() || !g_dx->geometryReady()) {
                 // loading overlay: rasterize off-thread on progress
                 // changes, consume the latest completed frame

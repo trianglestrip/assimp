@@ -212,6 +212,13 @@ public:
     // section, or that cannot skip it, ignore the call.
     virtual void setWantNormals(bool want) { (void)want; }
 
+    // Free the geometry pools after the consumer has uploaded them to
+    // the GPU (or copied the data out). PackMesh views into the pools
+    // become dangling; only mesh metadata (bounds, material, triangle
+    // counts) survives. Call only while no pool pointers are in use.
+    // Saves ~3/4 of the parse-time pool on huge models.
+    void releaseGeometry();
+
 protected:
     // subclasses call these when a stage completes
     void fireVertices(PackResult& r, std::span<const PackMesh> m) const;
@@ -306,6 +313,10 @@ public:
     // Parser attribute opt-outs (applied to the parser the facade
     // creates; ignored by parsers without the section)
     void setWantNormals(bool want);
+
+    // Forwarded to the parser: frees the geometry pools once the
+    // consumer has uploaded them (see ModelParser::releaseGeometry).
+    void releaseGeometry();
 
     // Blocking load; events fire before returning.
     bool load(std::string_view path);
