@@ -169,6 +169,7 @@ struct BakedFont {
     bool ok = false;
     std::vector<unsigned char> atlas;   // 8-bit alpha
     int W = 512, H = 256;
+    float ascent = 0.f;                 // pixels above the baseline
     stbtt_bakedchar chars[96];
 };
 static BakedFont g_fontHud, g_fontBig;
@@ -201,6 +202,9 @@ static void initFonts() {
             reinterpret_cast<const unsigned char*>(data.data()), 0, px,
             f.atlas.data(), f.W, f.H, 32, 96, f.chars);
         f.ok = r > 0;
+        // glyph bodies sit above the baseline (GetBakedQuad's y is the
+        // baseline, not the line top); ~0.8 * em for typical fonts
+        f.ascent = px * 0.8f;
     };
     bake(g_fontHud, 18.f);
     bake(g_fontBig, 36.f);
@@ -214,7 +218,7 @@ static void drawTextTTF(uint32_t* px, int bufW, int bufH, const BakedFont& f,
     if (!f.ok || !s) return;
     const uint32_t cr = (col >> 16) & 255, cg = (col >> 8) & 255,
                    cb = col & 255;
-    float fx = x, fy = y;
+    float fx = x, fy = y + f.ascent;   // baseline below the line top
     for (const char* p = s; *p; ++p) {
         const unsigned char c = (unsigned char)*p;
         if (c < 32 || c >= 128) continue;
@@ -259,9 +263,9 @@ static void fillRect(uint32_t* px, int bufW, int bufH,
 // 960x64 ARGB text strip -> RGBA bytes, ready for the HUD upload
 static std::vector<unsigned char> rasterHud(const std::string& line1) {
     std::vector<uint32_t> hud(size_t(kWinW) * 64, kBg);
-    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, line1.c_str(), 14, 6,
+    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, line1.c_str(), 14, 10,
                 kText);
-    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, kHudHelp, 14, 30, kText);
+    drawTextTTF(hud.data(), kWinW, 64, g_fontHud, kHudHelp, 14, 38, kText);
     std::vector<unsigned char> rgba(hud.size() * 4);
     for (size_t p = 0; p < hud.size(); ++p) {
         const uint32_t col = hud[p];
