@@ -12,6 +12,9 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <windows.h>   // before pix3.h (PCWSTR/BOOL types)
+#include <WinPixEventRuntime/pix3.h>   // PIX timeline markers (USE_PIX)
+
 #include <GraphicsMemory.h>
 #include <RenderTargetState.h>
 #include <ResourceUploadBatch.h>
@@ -333,10 +336,13 @@ struct DxRenderer::Impl {
     // ---- frame epilogue: resolve the MSAA target, draw the ImGui
     // overlay on the resolved back buffer, submit, present ----
     void endFrame(UINT f, const char* shotPath) {
-        barrier(msaaRT.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-        list->ResolveSubresource(back[f].Get(), 0, msaaRT.Get(), 0,
-                                 DXGI_FORMAT_R8G8B8A8_UNORM);
+        {
+            PIXScopedEvent(list.Get(), 0xFFC0A030, "msaa resolve");
+            barrier(msaaRT.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            list->ResolveSubresource(back[f].Get(), 0, msaaRT.Get(), 0,
+                                     DXGI_FORMAT_R8G8B8A8_UNORM);
+        }
 
         // ImGui's PSO is 1x MSAA, so the overlay cannot share the MSAA
         // target: draw it here, on the resolved back buffer, between the
@@ -346,6 +352,7 @@ struct DxRenderer::Impl {
         D3D12_RESOURCE_STATES backState = D3D12_RESOURCE_STATE_RESOLVE_DEST;
         if (imguiHeap && ImGui::GetCurrentContext() &&
             ImGui::GetDrawData() != nullptr) {
+            PIXScopedEvent(list.Get(), 0xFFC030C0, "imgui overlay");
             barrier(back[f].Get(), backState, D3D12_RESOURCE_STATE_RENDER_TARGET);
             const UINT rtvSize = dev->GetDescriptorHandleIncrementSize(
                 D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -367,25 +374,28 @@ struct DxRenderer::Impl {
             ++frameNo;
         }
 
-        if (shotPath) {
-            barrier(back[f].Get(), backState,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE);
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = readback.Get();
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            dst.PlacedFootprint.Footprint.Width = UINT(winW);
-            dst.PlacedFootprint.Footprint.Height = UINT(winH);
-            dst.PlacedFootprint.Footprint.Depth = 1;
-            dst.PlacedFootprint.Footprint.RowPitch = UINT(winW) * 4;
-            D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = back[f].Get();
-            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            barrier(back[f].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    D3D12_RESOURCE_STATE_PRESENT);
-        } else {
-            barrier(back[f].Get(), backState, D3D12_RESOURCE_STATE_PRESENT);
+        {
+            PIXScopedEvent(list.Get(), 0xFF808080, "present");
+            if (shotPath) {
+                barrier(back[f].Get(), backState,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = readback.Get();
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                dst.PlacedFootprint.Footprint.Width = UINT(winW);
+                dst.PlacedFootprint.Footprint.Height = UINT(winH);
+                dst.PlacedFootprint.Footprint.Depth = 1;
+                dst.PlacedFootprint.Footprint.RowPitch = UINT(winW) * 4;
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = back[f].Get();
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                barrier(back[f].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_PRESENT);
+            } else {
+                barrier(back[f].Get(), backState, D3D12_RESOURCE_STATE_PRESENT);
+            }
         }
 
         // flush this frame's uploads BEFORE the frame list executes (the
@@ -1050,7 +1060,9 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
         const D3D12_GPU_DESCRIPTOR_HANDLE srvGpuBase =
             dx.srvHeap->GetGPUDescriptorHandleForHeapStart();
         size_t n = 0;
-        while (texUploaded_ + n < texTotal && n < texBudget) {
+        {
+            PIXScopedEvent(dx.list.Get(), 0xFF4060C0, "texture uploads");
+            while (texUploaded_ + n < texTotal && n < texBudget) {
             const size_t i = texUploaded_ + n;
             const texp::DecodedTex& t = texs[i];
             // full mip chain + UAV access: GenerateMips (compute shader)
@@ -1079,6 +1091,7 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
             dx.texGpu[i] = g;
             ++n;
         }
+        }
         texUploaded_ += n;
         if (texUploaded_ == texTotal)
             AP_LOG("dx", "textures uploaded: %zu", texUploaded_);
@@ -1086,13 +1099,15 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
     const auto tUp0 = std::chrono::steady_clock::now();
 
     // scene
-    dx.list->SetGraphicsRoot32BitConstants(0, 16, cam, 0);
+    const auto tDr0 = std::chrono::steady_clock::now();
+    {
+        PIXScopedEvent(dx.list.Get(), 0xFF30C060, "scene draws");
+        dx.list->SetGraphicsRoot32BitConstants(0, 16, cam, 0);
     dx.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     const D3D12_VERTEX_BUFFER_VIEW vbvs[2] = {dx.vbvPos, dx.vbvUv};
     dx.list->IASetVertexBuffers(0, 2, vbvs);
     dx.list->IASetIndexBuffer(&dx.ibv);
     dx.list->SetPipelineState(dx.pso.Get());
-    const auto tDr0 = std::chrono::steady_clock::now();
     // draws are sorted by texture slot (viewer side), so the descriptor
     // table binds once per texture run instead of once per mesh
     int lastSlot = -2;
@@ -1125,6 +1140,7 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
     if (dx.queryHeap)
         dx.list->EndQuery(dx.queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                           UINT(dx.frameNo % dx.kQuerySlots) * 3 + 1);
+    }
     const auto tEn0 = std::chrono::steady_clock::now();
     dx.recordMs = float(std::chrono::duration<double, std::milli>(tEn0 - tUp0)
                             .count());

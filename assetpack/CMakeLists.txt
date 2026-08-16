@@ -89,12 +89,24 @@ if(ASSETPACK_WITH_VIEWER)
     target_link_libraries(assetpack_viewer PRIVATE assetpack imgui DirectXTK12
         "${SDL2_ROOT}/lib/x64/SDL2.lib" "${SDL2_ROOT}/lib/x64/SDL2main.lib"
         d3d12 dxgi d3dcompiler)
-    target_compile_definitions(assetpack_viewer PRIVATE SDL_MAIN_HANDLED NOMINMAX)
+    # PIX GPU capture: WinPixEventRuntime (vendored under third_party/pix,
+    # Microsoft license) provides programmatic capture - run the viewer with
+    # --pix <file.wpix> to record a GPU timeline for PIX analysis. USE_PIX
+    # turns the pix3.h stubs into the real event/capture API.
+    target_include_directories(assetpack_viewer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pix/include)
+    target_compile_definitions(assetpack_viewer PRIVATE
+        SDL_MAIN_HANDLED NOMINMAX USE_PIX=1)
+    target_link_libraries(assetpack_viewer PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pix/lib/x64/WinPixEventRuntime.lib")
     if(MSVC)
         target_compile_options(assetpack_viewer PRIVATE /utf-8 /Zi)
         target_link_options(assetpack_viewer PRIVATE /DEBUG)
     endif()
     add_custom_command(TARGET assetpack_viewer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${SDL2_ROOT}/lib/x64/SDL2.dll" $<TARGET_FILE_DIR:assetpack_viewer>)
+                "${SDL2_ROOT}/lib/x64/SDL2.dll" $<TARGET_FILE_DIR:assetpack_viewer>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pix/lib/x64/WinPixEventRuntime.dll"
+                $<TARGET_FILE_DIR:assetpack_viewer>)
 endif()

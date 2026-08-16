@@ -8,6 +8,7 @@
 //
 // Usage:  assetpack_viewer [model.obj] [--frames N] [--wait]
 //                          [--shot N file.bmp] [--untex] [--warp]
+//                          [--stat name] [--pix file.wpix]
 // With no model argument the default scene (San Miguel) is loaded, so the
 // built viewer opens a window immediately and streams the model in as the
 // parser stages complete: vertices first (meshes appear, default colors),
@@ -24,6 +25,9 @@
 
 #include "TexPipeline.h"     // parallel texture decode (mmap + stb_image)
 #include "DxRenderer.h"      // D3D12 backend (device, PSOs, uploads)
+
+#include <windows.h>   // before pix3.h (PCWSTR/BOOL types)
+#include <WinPixEventRuntime/pix3.h>   // programmatic GPU capture (--pix)
 
 #include <imgui.h>
 #include <imgui_impl_dx12.h>
@@ -138,6 +142,47 @@ std::ofstream g_statFile;
 double g_accCpu = 0, g_accGpu = 0, g_accScene = 0, g_accOvl = 0;
 double g_accWait = 0, g_accRecord = 0;
 size_t g_statN = 0;                    // averaged frames (skips the first 10)
+
+// ---- PIX programmatic GPU capture: --pix <file.wpix> starts recording on
+// the first scene frame and saves the whole run (for PIX timeline analysis
+// of per-draw GPU work) ----
+std::string g_pixPath;
+bool g_pixStarted = false;
+
+// Loads the newest %ProgramFiles%\Microsoft PIX\<version>\WinPixGpuCapturer
+// .dll BEFORE the D3D12 device exists: PIX only captures devices created
+// after the capturer is in the process, and WinPixEventRuntime's own lazy
+// load would be too late (it happens on the first scene frame).
+static HMODULE loadPixGpuCapturer() {
+    HMODULE h = GetModuleHandleW(L"WinPixGpuCapturer.dll");
+    if (h) return h;
+    wchar_t pattern[MAX_PATH];
+    const DWORD plen =
+        GetEnvironmentVariableW(L"ProgramFiles", pattern, MAX_PATH);
+    if (plen == 0 || plen >= MAX_PATH) return nullptr;
+    wcscat_s(pattern, L"\\Microsoft PIX\\*");
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return nullptr;
+    wchar_t bestVer[MAX_PATH] = {}, bestDll[MAX_PATH] = {};
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            fd.cFileName[0] == L'.')
+            continue;
+        wchar_t dir[MAX_PATH];
+        wcscpy_s(dir, pattern);
+        dir[wcslen(dir) - 1] = L'\0';   // drop the '*' wildcard
+        wcscat_s(dir, fd.cFileName);
+        wcscat_s(dir, L"\\WinPixGpuCapturer.dll");
+        if (GetFileAttributesW(dir) != INVALID_FILE_ATTRIBUTES &&
+            (bestVer[0] == L'\0' || wcscmp(fd.cFileName, bestVer) > 0)) {
+            wcscpy_s(bestVer, fd.cFileName);
+            wcscpy_s(bestDll, dir);
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return bestDll[0] ? LoadLibraryW(bestDll) : nullptr;
+}
 
 // ---- DX12 backend state (the implementation lives in DxRenderer) ----
 std::unique_ptr<DxRenderer> g_dx;
@@ -612,6 +657,8 @@ int main(int argc, char** argv) {
             i += 2;
         } else if (a == "--stat" && i + 1 < argc) {
             g_statName = argv[++i];   // per-frame CSV + compare-table tag
+        } else if (a == "--pix" && i + 1 < argc) {
+            g_pixPath = argv[++i];    // programmatic GPU capture target
         } else if (a.rfind("--", 0) != 0) {
             model = a;
         } else {
@@ -620,6 +667,12 @@ int main(int argc, char** argv) {
         }
     }
     g_modelName = model.substr(model.find_last_of("/\\") + 1);
+
+    // PIX capturer must be in-process before the D3D12 device is created
+    // (PIX does not capture devices that already exist)
+    if (!g_pixPath.empty() && !loadPixGpuCapturer())
+        std::fprintf(stderr,
+                     "warning: PIX GPU capturer not found; --pix will no-op\n");
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -767,6 +820,19 @@ int main(int argc, char** argv) {
                         << "frame,cpu_ms,gpu_ms,scene_ms,ovl_ms,wait_ms,"
                            "record_ms\n";
                 }
+                // PIX GPU capture: start on the first scene frame (the
+                // loading overlay and the parser already ran; what follows
+                // is steady-state scene rendering) and stop after the loop
+                if (!g_pixStarted && !g_pixPath.empty()) {
+                    std::wstring wp(g_pixPath.begin(), g_pixPath.end());
+                    PIXCaptureParameters pix{};
+                    pix.GpuCaptureParameters.FileName = wp.c_str();
+                    const HRESULT hr =
+                        PIXBeginCapture(PIX_CAPTURE_GPU, &pix);
+                    AP_LOG("viewer", "pix capture begin (0x%08X) -> %s",
+                           unsigned(hr), g_pixPath.c_str());
+                    g_pixStarted = true;
+                }
                 // camera constants: identical math to the software
                 // transform this viewer used to have (the vertex shader
                 // mirrors the layout)
@@ -887,6 +953,10 @@ int main(int argc, char** argv) {
             if (g_frames > 0 && (!g_waitAll || g_allDone.load()) &&
                 limit >= uint64_t(g_frames))
                 break;
+        }
+        if (g_pixStarted) {
+            PIXEndCapture(FALSE);   // flush + save the .wpix file
+            AP_LOG("viewer", "pix capture saved: %s", g_pixPath.c_str());
         }
         benchRenderLine(framesAll, fpsNow);
         if (g_statN > 0) benchCompareLine(fpsNow);
