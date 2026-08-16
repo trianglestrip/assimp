@@ -160,6 +160,17 @@ struct DxRenderer::Impl {
     // profile
     uint64_t frames = 0;
 
+    // GPU timing: timestamp query ring (3 per frame: frame start / scene
+    // end / overlay end), resolved into a readback buffer. Results are
+    // read two frames later, when the per-backbuffer fence in beginFrame
+    // guarantees the GPU has finished them (no stall on the hot path).
+    static constexpr UINT kQuerySlots = 8;
+    ComPtr<ID3D12QueryHeap> queryHeap;
+    ComPtr<ID3D12Resource> queryReadback;
+    UINT64 queryFreq = 1;
+    uint64_t frameNo = 0;
+    float gpuFrameMs = 0.f, gpuSceneMs = 0.f, gpuOverlayMs = 0.f;
+
     ~Impl() {
         if (fenceEvt) CloseHandle(fenceEvt);
     }
@@ -232,15 +243,56 @@ struct DxRenderer::Impl {
 
     // ---- frame prologue: wait only for the frame two submissions ago ----
     UINT beginFrame() {
+        const auto tB0 = std::chrono::steady_clock::now();
         const UINT f = swap->GetCurrentBackBufferIndex();
         waitFence(frameFence[f]);
+        const auto tB1 = std::chrono::steady_clock::now();
         if (uploadDone.valid())
             uploadDone.wait();          // uploads overlap, never pre-empt
+        const auto tB2 = std::chrono::steady_clock::now();
         gfxMem->GarbageCollect();
+        const auto tB3 = std::chrono::steady_clock::now();
+        // GPU timestamps: read the ring slot of two frames ago, which the
+        // per-backbuffer fence above guarantees is complete; this frame's
+        // start query is recorded below, after the list reset
+        if (queryHeap && frameNo >= 2) {
+            const UINT slot = UINT((frameNo - 2) % kQuerySlots);
+            void* p = nullptr;
+            if (SUCCEEDED(queryReadback->Map(0, nullptr, &p))) {
+                const UINT64* t =
+                    static_cast<const UINT64*>(p) + SIZE_T(slot) * 3;
+                // the timestamp clock follows the GPU's dynamic core
+                // clock, so re-query the frequency alongside the results
+                UINT64 freq = queryFreq;
+                queue->GetTimestampFrequency(&freq);
+                queryFreq = freq;
+                const double fq = double(freq);
+                const double dFrame = double(t[2] - t[0]),
+                             dScene = double(t[1] - t[0]),
+                             dOvl = double(t[2] - t[1]);
+                gpuFrameMs = float(dFrame * 1000.0 / fq);
+                gpuSceneMs = float(std::max(dScene, 0.0) * 1000.0 / fq);
+                gpuOverlayMs = float(std::max(dOvl, 0.0) * 1000.0 / fq);
+                D3D12_RANGE wr{};
+                queryReadback->Unmap(0, &wr);
+            }
+        }
         upload->Begin();
         uploadOpen = true;
         alloc[f]->Reset();
         list->Reset(alloc[f].Get(), nullptr);
+        if (queryHeap)
+            list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                           UINT(frameNo % kQuerySlots) * 3);
+        if (frames % 30 == 1) {
+            const auto tB4 = std::chrono::steady_clock::now();
+            AP_LOG("dx",
+                   "beginFrame: waitFence %.2f | upload %.2f | gc %.2f | rec %.2f ms",
+                   std::chrono::duration<double, std::milli>(tB1 - tB0).count(),
+                   std::chrono::duration<double, std::milli>(tB2 - tB1).count(),
+                   std::chrono::duration<double, std::milli>(tB3 - tB2).count(),
+                   std::chrono::duration<double, std::milli>(tB4 - tB3).count());
+        }
 
         // everything (scene + overlay sprites) renders into the MSAA
         // target; the back buffer only receives the resolved image
@@ -298,6 +350,16 @@ struct DxRenderer::Impl {
             list->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), list.Get());
             backState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+
+        // GPU timestamps: overlay done; resolve this frame's ring slot
+        if (queryHeap) {
+            const UINT qBase = UINT(frameNo % kQuerySlots) * 3;
+            list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                           qBase + 2);
+            list->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                   qBase, 3, queryReadback.Get(), qBase * 8);
+            ++frameNo;
         }
 
         if (shotPath) {
@@ -752,9 +814,36 @@ float4 main(PSIn i) : SV_Target {
         }
     }
 
+    // ---- GPU timing: timestamp query ring for the overlay stats ----
+    {
+        D3D12_QUERY_HEAP_DESC qh{};
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = Impl::kQuerySlots * 3;
+        if (SUCCEEDED(dx.dev->CreateQueryHeap(&qh, IID_PPV_ARGS(&dx.queryHeap)))) {
+            dx.queryReadback = dx.makeBuf(
+                Impl::kQuerySlots * 3 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            dx.queue->GetTimestampFrequency(&dx.queryFreq);
+        } else {
+            AP_LOG_WARN("dx", "timestamp query heap creation failed");
+        }
+    }
+
     up_ = true;
     AP_LOG("dx", "ready: %dx%d swapchain, %u back buffers", w, h, kBackBuffers);
     return true;
+}
+
+void DxRenderer::gpuTiming(float& frameMs, float& sceneMs,
+                           float& overlayMs) const {
+    if (!impl_) {
+        frameMs = sceneMs = overlayMs = 0.f;
+        return;
+    }
+    const Impl& dx = *impl_;
+    frameMs = dx.gpuFrameMs;
+    sceneMs = dx.gpuSceneMs;
+    overlayMs = dx.gpuOverlayMs;
 }
 
 void DxRenderer::shutdown() {
@@ -769,6 +858,8 @@ void DxRenderer::shutdown() {
     }
     if (dx.imguiHeap)
         ImGui_ImplDX12_Shutdown();
+    dx.queryHeap.Reset();
+    dx.queryReadback.Reset();
     dx.sprites.reset();
     dx.gfxMem.reset();
     dx.upload.reset();
@@ -910,6 +1001,9 @@ void DxRenderer::drawLoading(const uint32_t* argb) {
     dx.sprites->Draw(dx.loadGpu, XMUINT2(UINT(dx.winW), UINT(dx.winH)),
                      XMFLOAT2(0.f, 0.f));
     dx.sprites->End();
+    if (dx.queryHeap)   // mark the sprite draw as the "scene" segment
+        dx.list->EndQuery(dx.queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                          UINT(dx.frameNo % dx.kQuerySlots) * 3 + 1);
 
     dx.endFrame(f, nullptr);
     ++dx.frames;
@@ -974,6 +1068,7 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
         if (texUploaded_ == texTotal)
             AP_LOG("dx", "textures uploaded: %zu", texUploaded_);
     }
+    const auto tUp0 = std::chrono::steady_clock::now();
 
     // scene
     dx.list->SetGraphicsRoot32BitConstants(0, 16, cam, 0);
@@ -982,6 +1077,10 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
     dx.list->IASetVertexBuffers(0, 2, vbvs);
     dx.list->IASetIndexBuffer(&dx.ibv);
     dx.list->SetPipelineState(dx.pso.Get());
+    const auto tDr0 = std::chrono::steady_clock::now();
+    // draws are sorted by texture slot (viewer side), so the descriptor
+    // table binds once per texture run instead of once per mesh
+    int lastSlot = -2;
     for (const DrawItem& it : items) {
         if (!it.indexCount) continue;
         D3D12_GPU_DESCRIPTOR_HANDLE texGpu = dx.whiteGpu;
@@ -998,13 +1097,26 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
             1.f,
             float(hasTex),
         };
-        dx.list->SetGraphicsRootDescriptorTable(2, texGpu);
+        if (it.texSlot != lastSlot) {
+            dx.list->SetGraphicsRootDescriptorTable(2, texGpu);
+            lastSlot = it.texSlot;
+        }
         dx.list->SetGraphicsRoot32BitConstants(1, 5, mats, 0);
         dx.list->DrawIndexedInstanced(it.indexCount, 1, it.startIndex, 0, 0);
     }
 
     // (the ImGui overlay is drawn inside endFrame, after the MSAA
     // resolve, so the 1x-MSAA ImGui PSO has a compatible target)
+    if (dx.queryHeap)
+        dx.list->EndQuery(dx.queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                          UINT(dx.frameNo % dx.kQuerySlots) * 3 + 1);
+    const auto tEn0 = std::chrono::steady_clock::now();
+    if (dx.frames % 30 == 1) {
+        AP_LOG("dx", "drawScene: begin %.2f | upload %.2f | record %.2f ms",
+               std::chrono::duration<double, std::milli>(tDr0 - t0).count(),
+               std::chrono::duration<double, std::milli>(tUp0 - tDr0).count(),
+               std::chrono::duration<double, std::milli>(tEn0 - tUp0).count());
+    }
 
     dx.endFrame(f, shotPath);
     ++dx.frames;

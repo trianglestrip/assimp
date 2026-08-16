@@ -126,7 +126,8 @@ GeometryStage::GeometryStage(
       uvIdx_(std::make_shared<std::vector<uint32_t>>()),
       shards_(std::make_shared<std::array<detail::SeamShard, 16>>()),
       seamCounter_(std::make_shared<std::atomic<uint32_t>>(0)),
-      baseVerts_(std::make_shared<size_t>(0)) {}
+      baseVerts_(std::make_shared<size_t>(0)),
+      texMats_(std::make_shared<std::unordered_set<std::string_view>>()) {}
 
 void GeometryStage::run(tf::Subflow& sf) {
     if (!result_->objFile) return;
@@ -159,6 +160,7 @@ void GeometryStage::run(tf::Subflow& sf) {
     const auto seamCounter = seamCounter_;
     const auto baseVerts = baseVerts_;
     const auto mtlNames = mtlNames_;
+    const auto texMats = texMats_;
     const bool wantN = wantN_;
 
     // pass 1 (parallel): per-chunk counts + ordered markers
@@ -205,6 +207,18 @@ void GeometryStage::run(tf::Subflow& sf) {
             c.basePos = p; c.baseNrm = n; c.baseUv = u; c.baseTri = t;
             p += c.nPos; n += c.nNrm; u += c.nUv; t += c.nTri;
         }
+        // thread the running usemtl across chunk boundaries so pass2 can
+        // skip seam-splitting for untextured materials; markers are
+        // position-ordered, so a marker at chunk start covers no faces
+        // before it and the pre-marker material is the right default
+        std::string_view curMtl;
+        for (int i = 0; i < nChunks; ++i) {
+            ChunkInfo& c = (*chunks)[size_t(i)];
+            c.startMtl = curMtl;
+            for (const Marker& m : c.markers)
+                if (m.kind == LineKind::UseMtl)
+                    curMtl = std::string_view(m.name, m.nameLen);
+        }
         result->positions.resize(p * 3);
         result->posIndices.resize(t * 3);
         if (wantN) vnPool->resize(n * 3);
@@ -229,11 +243,44 @@ void GeometryStage::run(tf::Subflow& sf) {
                p, n, u, t);
     });
 
+    // which materials carry a diffuse map. The seam split exists to keep
+    // UV seams watertight for textured rendering; meshes whose material
+    // has no map_Kd sample nothing (the viewer falls back to a white
+    // texel), so splitting them just duplicates vertices for nothing.
+    // The scan mirrors Mtl.cpp's exact-case keyword matching: a material
+    // the mtl parser would not bind a texture to must not split either.
+    // Runs ahead of pass2 while the materials task (a sibling stage)
+    // parses the same file in parallel; this only reads it.
+    tf::Task mtlTex = sf.emplace([result, texMats]() {
+        const std::shared_ptr<MappedFile>& mf = result->mtlFile;
+        if (!mf) return;
+        const std::string_view text = mf->text();
+        const char* p = text.data();
+        const char* end = p + text.size();
+        std::string_view cur;
+        while (p < end) {
+            const char* eol = static_cast<const char*>(
+                memchr(p, '\n', size_t(end - p)));
+            if (!eol) eol = end;
+            if (eol - p > 7 && memcmp(p, "newmtl ", 7) == 0) {
+                const char* tok; size_t len;
+                if (nextToken(p + 7, eol, tok, len))
+                    cur = std::string_view(tok, len);
+            } else if (!cur.empty() && eol - p > 7
+                       && memcmp(p, "map_Kd ", 7) == 0) {
+                texMats->insert(cur);
+            }
+            p = eol + 1;
+        }
+        AP_LOG("geometry", "mtl diffuse maps: %zu materials",
+               texMats->size());
+    });
+
     // pass 2 (parallel): fill arrays; fan-triangulate faces and
     // resolve 1-based / negative-relative indices per chunk
     tf::Task pass2 = sf.for_each_index(0, nChunks, 1,
         [chunks, result, vnPool, uvPool, vnIdx, uvIdx, data, wantN,
-         shards, seamCounter, baseVerts](int ci) {
+         shards, seamCounter, baseVerts, texMats](int ci) {
             ChunkInfo& c = (*chunks)[size_t(ci)];
             const char* p = data + c.begin;
             const char* end = data + c.end;
@@ -242,6 +289,11 @@ void GeometryStage::run(tf::Subflow& sf) {
             float* nrm = vnPool->data();
             float* uv  = uvPool->data();
             uint32_t* pi = result->posIndices.data() + c.baseTri * 3;
+            // the usemtl in effect here decides whether faces split on
+            // texture seams; untextured materials never split (see mtlTex)
+            std::string_view curMtl = c.startMtl;
+            bool split = !curMtl.empty()
+                         && texMats->find(curMtl) != texMats->end();
 
             while (p < end) {
                 const char* eol = static_cast<const char*>(
@@ -275,6 +327,13 @@ void GeometryStage::run(tf::Subflow& sf) {
                         uv[lu * 2 + comp] = parseFloat(tok, len);
                     }
                     ++lu;
+                } else if (k == LineKind::UseMtl) {
+                    const char* tok; size_t len;
+                    if (nextToken(p + 7, eol, tok, len)) {
+                        curMtl = std::string_view(tok, len);
+                        split = !curMtl.empty()
+                                && texMats->find(curMtl) != texMats->end();
+                    }
                 } else if (k == LineKind::F) {
                     // fan triangulation: emit (v0, vi-1, vi) from the
                     // third vertex on; pass1 counts verts-2, so exactly
@@ -292,15 +351,20 @@ void GeometryStage::run(tf::Subflow& sf) {
                                 vn >= 0 ? uint32_t(vn) : 0xFFFFFFFFu;
                             // first (vt, vn) combo claims the position
                             // slot; a conflicting combo is a texture
-                            // seam and splits into its own vertex
+                            // seam and splits into its own vertex.
+                            // Untextured materials skip the claim entirely:
+                            // their UVs are never sampled, so a position
+                            // may alias any number of (vt, vn) combos
                             bool uniq = true;
-                            if (vtU != 0xFFFFFFFFu && !uvIdx->empty()
-                                && !detail::claimIdx((*uvIdx)[ip], vtU))
-                                uniq = false;
-                            if (uniq && vnU != 0xFFFFFFFFu
-                                && !vnIdx->empty()
-                                && !detail::claimIdx((*vnIdx)[ip], vnU))
-                                uniq = false;
+                            if (split) {
+                                if (vtU != 0xFFFFFFFFu && !uvIdx->empty()
+                                    && !detail::claimIdx((*uvIdx)[ip], vtU))
+                                    uniq = false;
+                                if (uniq && vnU != 0xFFFFFFFFu
+                                    && !vnIdx->empty()
+                                    && !detail::claimIdx((*vnIdx)[ip], vnU))
+                                    uniq = false;
+                            }
                             uint32_t out = ip;
                             if (!uniq) {
                                 const detail::SeamVert sv{ip, vtU, vnU};
@@ -571,6 +635,7 @@ void GeometryStage::run(tf::Subflow& sf) {
 
     pass1.precede(prefix);
     prefix.precede(pass2);
+    mtlTex.precede(pass2);
     pass2.precede(seamFill, stamp2);   // stamp2 is a side branch: it
                                        // logs without blocking pass3
     seamFill.precede(pass3);

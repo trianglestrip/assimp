@@ -10,6 +10,7 @@
 #include <atomic>
 #include <memory>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include <taskflow/taskflow.hpp>
@@ -49,6 +50,9 @@ private:
     std::shared_ptr<std::array<detail::SeamShard, 16>> shards_;
     std::shared_ptr<std::atomic<uint32_t>> seamCounter_;
     std::shared_ptr<size_t> baseVerts_;
+    // material names that carry a diffuse map (views into the mtl
+    // mapping); pass2 skips seam-splitting for every other material
+    std::shared_ptr<std::unordered_set<std::string_view>> texMats_;
 };
 
 } // namespace ap::obj

@@ -73,6 +73,11 @@ public:
     bool geometryReady() const { return psoUp_; }
     size_t texturesUploaded() const { return texUploaded_; }
 
+    // GPU frame timing from timestamp queries (ms, updated every frame):
+    // frame = scene draws + MSAA resolve + ImGui overlay; scene = mesh
+    // draws only. Zero until a couple of frames have elapsed.
+    void gpuTiming(float& frameMs, float& sceneMs, float& overlayMs) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

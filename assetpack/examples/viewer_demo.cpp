@@ -126,6 +126,8 @@ std::string g_shotFile;
 std::string g_modelName;
 uint64_t g_frameCount = 0;
 Clock::time_point g_tLoad;
+double g_cpuFrameMs = 0;                 // last loop iteration, shown by the overlay
+Clock::time_point g_tPrevLoop;           // frame pacing reference for the above
 
 // ---- DX12 backend state (the implementation lives in DxRenderer) ----
 std::unique_ptr<DxRenderer> g_dx;
@@ -303,9 +305,18 @@ static void buildUi(double fpsNow) {
     if (g_allDone.load()) {
         ImGui::Text("%llu tris | %.1f fps",
                     (unsigned long long)g_meshTriStart.back(), fpsNow);
-        ImGui::Text("import %.1f ms | total %.1f ms", g_importMs, g_totalMs);
     } else {
         ImGui::ProgressBar(g_progress.load() / 100.f, ImVec2(-1.f, 0.f), "");
+    }
+    // CPU frame time (measured in the loop) vs GPU frame time (timestamp
+    // queries, read back two frames late by the renderer); the gap shows
+    // which side is the bottleneck
+    float gFrame = 0.f, gScene = 0.f, gOvl = 0.f;
+    if (g_dx) g_dx->gpuTiming(gFrame, gScene, gOvl);
+    ImGui::Text("cpu %6.2f ms | gpu %6.2f ms", g_cpuFrameMs, gFrame);
+    if (g_allDone.load()) {
+        ImGui::Text("scene %6.2f + ovl %5.2f ms", gScene, gOvl);
+        ImGui::Text("import %.1f ms | total %.1f ms", g_importMs, g_totalMs);
     }
     if (g_texPipe.count() > 0)
         ImGui::Text("%zu textures%s", g_texPipe.count(),
@@ -604,6 +615,8 @@ int main(int argc, char** argv) {
         while (!g_quit.load()) {
             SDL_Event e;
             const ImGuiIO& io = ImGui::GetIO();
+            const auto tEv0 = Clock::now();
+            Clock::time_point tIt0, tDs0;   // set in the scene branch below
             while (SDL_PollEvent(&e)) {
                 ImGui_ImplSDL2_ProcessEvent(&e);
                 if (e.type == SDL_QUIT) {
@@ -664,6 +677,7 @@ int main(int argc, char** argv) {
             ImGui::NewFrame();
             buildUi(fpsNow);
             ImGui::Render();
+            const auto tUi0 = Clock::now();
 
             // stage the parser pools once (idempotent) as soon as they
             // exist. With the corrected +y-up NDC the view-space CCW
@@ -730,6 +744,14 @@ int main(int argc, char** argv) {
                     it.texSlot = texOn && g_meshTex[i] >= 0 ? g_meshTex[i] : -1;
                     items.push_back(it);
                 }
+                // group same-texture draws: the renderer binds the texture
+                // descriptor table once per run instead of once per mesh
+                std::stable_sort(items.begin(), items.end(),
+                                 [](const DxRenderer::DrawItem& a,
+                                    const DxRenderer::DrawItem& b) {
+                                     return a.texSlot < b.texSlot;
+                                 });
+                tIt0 = Clock::now();
 
                 // drawScene consumes g_dxShotNext; the frame after the shot
                 // request is captured (content is identical: static camera
@@ -737,6 +759,7 @@ int main(int argc, char** argv) {
                 g_dx->drawScene(cam, items, g_texPipe.data(), g_texPipe.count(),
                                 32, g_dxShotNext.empty() ? nullptr
                                                          : g_dxShotNext.c_str());
+                tDs0 = Clock::now();
                 g_dxShotNext.clear();
                 // ResourceUploadBatch::End copies the sources into its
                 // staging buffers synchronously, so once the frame is
@@ -749,6 +772,32 @@ int main(int argc, char** argv) {
                 }
             }
             ++g_frameCount;
+            // CPU frame time (displayed by the overlay next frame)
+            const auto tLoop = Clock::now();
+            g_cpuFrameMs =
+                std::chrono::duration<double, std::milli>(tLoop - g_tPrevLoop)
+                    .count();
+            g_tPrevLoop = tLoop;
+            // periodic telemetry (the overlay shows the same numbers live)
+            if (g_frameCount % 30 == 0) {
+                float gF = 0, gS = 0, gO = 0;
+                g_dx->gpuTiming(gF, gS, gO);
+                const auto tNow = Clock::now();
+                const double evMs =
+                    std::chrono::duration<double, std::milli>(tUi0 - tEv0)
+                        .count();
+                const double uiMs =
+                    std::chrono::duration<double, std::milli>(tIt0 - tUi0)
+                        .count();
+                const double dsMs =
+                    std::chrono::duration<double, std::milli>(tNow - tIt0)
+                        .count();
+                AP_LOG("viewer",
+                       "frame %llu: cpu %.2f ms [events %.2f + ui %.2f + draw %.2f]"
+                       " | gpu %.2f ms (scene %.2f + ovl %.2f)",
+                       (unsigned long long)g_frameCount, g_cpuFrameMs, evMs,
+                       uiMs, dsMs, gF, gS, gO);
+            }
 
             if (g_allDone.load()) {
                 if (!tAll) tAll = Clock::now();

@@ -17,7 +17,9 @@ all ──► onAllDone
 几何与材质/贴图解析同时开始、互不等待。几何是 chunk 并行两遍扫描：
 pass1 计数 + 前缀和定位，pass2 填充扁平数组 + 扇形三角化 + 负索引
 解析；pass3 把 OBJ 的 vn/vt 引用展开成与位置一一对应的每顶点数组
-（渲染契约）。
+（渲染契约）。纹理接缝顶点分裂（镜像/接缝 uv 需要）只对**含
+map_Kd 贴图的材质**生效：解析前用一次毫秒级 mtl 扫描确定带 diffuse
+贴图的材质集，无贴图网格直接复用基顶点，不再复制顶点。
 
 解析器接口：`ap::ModelParser`（基础类，统一事件/输出），
 `ap::ObjParser : ModelParser`（OBJ/MTL 实现），`ap::AssetPack` 是
@@ -51,8 +53,9 @@ build\Release\pack_demo.exe F:\project\meshToBrowser\models\San_Miguel\san-migue
 ```
 
 San Miguel（1.14GB OBJ）实测：5.93M 位置顶点 / 9.98M 三角形 / 2203 meshes /
-287 材质 / 323 贴图引用。几何解析（含纹理接缝顶点分裂：5.93M → 9.02M
-输出顶点，保证镜像/接缝 uv 正确）热缓存约 1.9s（assimp 版为 14s+）。
+287 材质 / 323 贴图引用。几何解析（纹理接缝顶点分裂只对带贴图材质：
+5.93M → 8.04M 输出顶点，无贴图的 1086 个 mesh 不再复制顶点）热缓存
+约 1.0s（assimp 版为 14s+；优化前为 1.2s / 9.02M 顶点）。
 每次运行把各阶段耗时追加到 benchmark.md。
 
 ## 查看器（assetpack_viewer）
@@ -78,12 +81,17 @@ build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
   显示侧 HUD/加载条在独立 `tf::Executor` 上异步光栅化(最新完成
   交接,渲染线程零等待)。帧调度为双缓冲在飞(按帧 fence 等待,
   不再全量等 GPU 空闲)、几何零拷贝上传(positions/texcoords/索引
-  池原样进 VBO/IBO)、贴图分帧上传并即用即释。
+  池原样进 VBO/IBO)、贴图分帧上传并即用即释。绘制前按贴图槽对
+  draw item 排序，渲染器每段贴图只绑定一次描述符表（2203 draws
+  录制 ~3.2 ms，优化前 ~3.6 ms）。
+- ImGui HUD（third_party/imgui 静态库）：面板实时显示模型名、三角形
+  数、CPU/GPU 帧时间、scene/overlay 分段、贴图数；GPU 时间用 D3D12
+  timestamp query 环测量（延迟两帧读回，不阻塞热路径）。
 - mmap + taskflow 的自定义 OBJ/MTL 解析器和 stb_image 贴图解码,
   不依赖 assimp;法线默认解析(`setWantNormals(false)` 可选跳过)。
 - 贴图上传后用 DirectXTK12 `GenerateMips` 在 GPU 生成完整 mip 链,
   采样器 point + mip 线性(近处保持锐利 texel,远处按 mip 混合),
-  San Miguel 全画约 38 fps(无 mip 时 16 fps)。
+  稳态约 60 fps（窗口合成器锁帧；无 mip 时远处过采样拉高 GPU 时间）。
 - 鼠标交互：左键拖拽旋转视角、滚轮缩放（距离 0.15..10，可贴近
   模型表面）；无自动旋转，WASD 沿视线前进/后退 + 左右平移
   （步长随缩放距离缩放）。
@@ -101,3 +109,44 @@ build\Release\assetpack_viewer.exe --wait --frames 60   # 解析完成后计帧
 stb_image / stb_truetype（已随仓库提供 third_party/stb，界面文字用
 系统 Consolas 烘焙）、DirectXTK12（已随仓库提供 external/DirectXTK12）；
 路径用 `-DSDL2_ROOT=...` 配置。
+
+## 性能（San Miguel 实测，RTX 2060 SUPER @ 1080p）
+
+帧时间分解（每 30 帧遥测，D3D12 timestamp query 测 GPU、steady_clock
+测 CPU）：
+
+| 段 | 耗时 | 说明 |
+| --- | ---: | --- |
+| CPU 整帧 | 16.7 ms | 稳定 60 fps |
+| └ waitFence | ~12.3 ms | 等两帧前 fence；与合成器节奏吻合 |
+| └ 绘制录制 | ~3.2 ms | 2203 draws（优化前 3.6 ms） |
+| └ 事件/UI | ~0.1 ms | SDL 事件 + ImGui |
+| GPU 整帧 | ~3.7 ms | 其中 scene 3.7 + ImGui overlay 0.02 |
+| Present | 0.08 ms | 非阻塞 |
+
+**瓶颈定位**：GPU 每帧只忙 ~3.7 ms（22%），CPU 有效工作 ~5 ms（30%），
+帧率精确锁 60 fps —— 限速的是窗口合成器（flip-model 交换链 + 2 个
+后备缓冲被 DWM 以 60 Hz 节奏调度），不是 GPU 也不是 CPU。证明：
+waitFence 12.3 ms ≈ 16.7 − CPU 有效 ~5 ms，且 GPU 时间刻度曾因缓存
+timestamp 频率被低估（timestamp 时钟跟随 GPU 动态核心时钟，读回时
+必须重新 `GetTimestampFrequency`，否则显示 4.5 ms 与墙钟矛盾）。
+
+**已执行优化**：
+
+1. **无贴图材质跳过纹理接缝分裂**（解析器）。接缝分裂的存在意义是
+   贴图采样时 uv 接缝不漏缝；无 map_Kd 的 mesh 渲染回退白色，分裂
+   纯属复制顶点。新增一次毫秒级 mtl 扫描得到带 diffuse 贴图的材质集，
+   pass2 按当前 usemtl 决定是否分裂（chunk 边界处由前缀任务把材质名
+   跨块串接）。效果：分裂顶点 3,088,160 → 2,104,434（-32%），输出
+   顶点 9,021,393 → 8,037,667（-10.9%，约 -20 MB 顶点数据），导入
+   1222 ms → 1010 ms（-17%）。贴图网格路径字节级不变。
+2. **按贴图槽排序 draw item + 描述符表按段绑定**（渲染器）。2203 次
+   逐 draw 的描述符表绑定改为每段贴图一次：录制 3.60 → 3.17 ms（-12%）。
+3. **GPU 时间测量修复**：读回 timestamp 时重新查询频率（见上）。
+
+**待评估的优化方向**：4x MSAA 是 ROP 大头（1x 可把 scene ~3.7 ms 降到
+~1 ms 量级，但以抗锯齿质量为代价，可做运行时开关）；16-bit 索引
+（29.9M 索引 120 MB → ~60 MB，需解析器/渲染器双池改造，纯加载期
+收益）；mesh 合并（2203 draws → 按材质几百次，削减 CPU 录制）；
+depth prepass（过绘制场景的 PS 减负，双倍 draw 数）。60 fps 之上
+需要无合成器路径（独占全屏 / tearing），当前窗口化模式无法突破。

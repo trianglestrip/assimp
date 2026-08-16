@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 #include "detail/TextScan.h"   // nextToken / parseInt
@@ -75,6 +76,11 @@ struct ChunkInfo {
     std::vector<Marker> markers;
     // prefix bases (filled between passes)
     size_t basePos = 0, baseNrm = 0, baseUv = 0, baseTri = 0;
+    // usemtl in effect at this chunk's first face (filled by the prefix
+    // task; empty when no usemtl precedes the chunk). A chunk boundary
+    // can fall between a usemtl and the faces it covers, so the running
+    // material is threaded across chunks, not resolved per chunk.
+    std::string_view startMtl;
 };
 
 } // namespace ap::obj
