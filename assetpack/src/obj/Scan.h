@@ -21,10 +21,11 @@ uint32_t countFaceVerts(const char* p, const char* end);
 
 // Resolve a 1-based or negative-relative OBJ index against its pool.
 // Negative indices count back from the last definition so far, which
-// is base (chunk prefix) + running (definitions seen within the chunk).
-inline int32_t resolveIndex(int64_t raw, size_t base, size_t running) {
+// the caller passes as the running count of definitions seen up to
+// this line (chunk prefix base included).
+inline int32_t resolveIndex(int64_t raw, size_t running) {
     if (raw > 0) return int32_t(raw - 1);
-    return int32_t(int64_t(base + running) + raw);
+    return int32_t(int64_t(running) + raw);
 }
 
 // Parse one 'f' line; invoke fn(v, vt, vn) per vertex with resolved
@@ -53,11 +54,11 @@ inline void forEachFaceVertex(const char* p, const char* eol,
             }
         }
         const int32_t v  = segLen[0] ? resolveIndex(parseInt(seg[0], segLen[0]),
-                                                    baseV, runV) : -1;
+                                                    runV) : -1;
         const int32_t vt = segLen[1] ? resolveIndex(parseInt(seg[1], segLen[1]),
-                                                    baseUv, runUv) : -1;
+                                                    runUv) : -1;
         const int32_t vn = segLen[2] ? resolveIndex(parseInt(seg[2], segLen[2]),
-                                                    baseNrm, runNrm) : -1;
+                                                    runNrm) : -1;
         fn(v, vt, vn);
     }
 }
