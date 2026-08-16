@@ -1,5 +1,5 @@
 #include "DxRenderer.h"
-#include <assetpack/Log.h>
+#include <assetpack/AssetPack.h>
 
 #include <SDL2/SDL_syswm.h>
 

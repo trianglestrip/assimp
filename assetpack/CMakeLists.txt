@@ -10,14 +10,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 解析），模型/材质/贴图三段解析完成各自触发带数据的事件。
 
 # ---- library ----
+# 文件结构：include/ 只放对外 API；src/detail 通用工具；src/obj 是
+# OBJ/MTL 解析器内部分层（Scan 文本扫描 / Geometry 几何子流 / Mtl 材质）。
 add_library(assetpack
     src/AssetPack.cpp
     src/ObjParser.cpp
     src/MappedFile.cpp
     src/Log.cpp
+    src/obj/Scan.cpp
+    src/obj/Geometry.cpp
+    src/obj/Mtl.cpp
 )
 target_include_directories(assetpack
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src           # detail/ obj/ 内部头
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party   # <taskflow/taskflow.hpp>
 )
 target_compile_features(assetpack PUBLIC cxx_std_20)

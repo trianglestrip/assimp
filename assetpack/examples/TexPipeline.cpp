@@ -1,5 +1,5 @@
 #include "TexPipeline.h"
-#include <assetpack/Log.h>
+#include <assetpack/AssetPack.h>
 
 #include <atomic>
 #include <thread>

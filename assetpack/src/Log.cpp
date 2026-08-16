@@ -1,4 +1,4 @@
-#include <assetpack/Log.h>
+#include <assetpack/AssetPack.h>
 
 #include <chrono>
 #include <cstdio>

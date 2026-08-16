@@ -10,7 +10,7 @@
 // trip), the software rasterizer samples the same bytes.
 // ============================================================
 
-#include <assetpack/ModelParser.h>
+#include <assetpack/AssetPack.h>
 
 #include <cstdint>
 #include <memory>

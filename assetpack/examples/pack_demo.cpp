@@ -8,7 +8,6 @@
 //   textures  -> span<PackTexture>  (path / embedded bytes / resolved path)
 
 #include <assetpack/AssetPack.h>
-#include <assetpack/Log.h>
 
 #include <chrono>
 #include <cstdio>

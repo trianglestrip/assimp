@@ -17,7 +17,6 @@
 // WASD: move along the view axis / strafe | Q/E: camera height
 
 #include <assetpack/AssetPack.h>
-#include <assetpack/Log.h>
 
 #include <SDL2/SDL.h>
 
