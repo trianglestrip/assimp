@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ap::obj {
 
@@ -19,6 +20,7 @@ inline int slotToTexType(std::string_view slot) {
     if (slot == "map_Ks")   return TexSpecular;
     if (slot == "map_d")    return TexOpacity;
     if (slot == "map_Bump") return TexNormal;
+    if (slot == "map_Ke")   return TexEmissive;
     return TexDiffuse;
 }
 
@@ -75,10 +77,21 @@ void parseMtl(const std::shared_ptr<PackResult>& result,
                     if (!(q = nextToken(q, eol, tok, len))) break;
                     m->Ks[i] = parseFloat(tok, len);
                 }
+            } else if (eol - p > 3 && memcmp(p, "Ke ", 3) == 0) {
+                q = p + 3;
+                for (int i = 0; i < 3; ++i) {
+                    if (!(q = nextToken(q, eol, tok, len))) break;
+                    m->Ke[i] = parseFloat(tok, len);
+                }
             } else if (eol - p > 3 && memcmp(p, "Ns ", 3) == 0) {
                 if (nextToken(p + 3, eol, tok, len)) m->Ns = parseFloat(tok, len);
             } else if (eol - p > 2 && memcmp(p, "d ", 2) == 0) {
                 if (nextToken(p + 2, eol, tok, len)) m->d = parseFloat(tok, len);
+            } else if (eol - p > 3 && memcmp(p, "Tr ", 3) == 0) {
+                if (nextToken(p + 3, eol, tok, len)) {
+                    m->Tr = parseFloat(tok, len);
+                    m->hasTr = true;
+                }
             } else if (eol - p > 6 && memcmp(p, "illum ", 6) == 0) {
                 if (nextToken(p + 6, eol, tok, len))
                     m->illum = int32_t(parseInt(tok, len));
@@ -92,6 +105,10 @@ void parseMtl(const std::shared_ptr<PackResult>& result,
                 if (nextToken(p + 6, eol, tok, len)) setPath(m->mapD, tok, len);
             } else if (eol - p > 9 && memcmp(p, "map_Bump ", 9) == 0) {
                 if (nextToken(p + 9, eol, tok, len)) setPath(m->mapBump, tok, len);
+            } else if (eol - p > 7 && memcmp(p, "map_Ke ", 8) == 0) {
+                if (nextToken(p + 8, eol, tok, len)) setPath(m->mapKe, tok, len);
+            } else if (eol - p > 7 && memcmp(p, "map_Tr ", 8) == 0) {
+                if (nextToken(p + 8, eol, tok, len)) setPath(m->mapTr, tok, len);
             } else if (eol - p > 5 && memcmp(p, "bump ", 5) == 0) {
                 if (nextToken(p + 5, eol, tok, len)) setPath(m->mapBump, tok, len);
             }
@@ -110,7 +127,9 @@ void parseMtl(const std::shared_ptr<PackResult>& result,
         pm.ambient[2] = m.Ka[2]; pm.ambient[3] = 1.f;
         pm.specular[0] = m.Ks[0]; pm.specular[1] = m.Ks[1];
         pm.specular[2] = m.Ks[2]; pm.specular[3] = 1.f;
-        pm.opacity = m.d;
+        pm.emissive[0] = m.Ke[0]; pm.emissive[1] = m.Ke[1];
+        pm.emissive[2] = m.Ke[2]; pm.emissive[3] = 1.f;
+        pm.opacity = m.hasTr ? (1.f - m.Tr) : m.d;
         pm.shininess = m.Ns;
         auto add = [&](const std::string_view& path, int type) {
             if (!path.empty()) pm.textures.push_back({ type, 0, path });
@@ -120,6 +139,8 @@ void parseMtl(const std::shared_ptr<PackResult>& result,
         add(m.mapKs,   TexSpecular);
         add(m.mapD,    TexOpacity);
         add(m.mapBump, TexNormal);
+        add(m.mapKe,   TexEmissive);
+        add(m.mapTr,   TexOpacity);
         result->materials.push_back(pm);
     }
 
@@ -131,7 +152,8 @@ void parseMtl(const std::shared_ptr<PackResult>& result,
 
 void buildTextureRefs(
     ObjParser& owner, const std::shared_ptr<PackResult>& result,
-    const std::shared_ptr<std::vector<RawMaterial>>& rawMats) {
+    const std::shared_ptr<std::vector<RawMaterial>>& rawMats,
+    bool loadBytes) {
     if (!result->mtlFile) return;
     const auto tStart = Clock::now();
 
@@ -146,6 +168,8 @@ void buildTextureRefs(
         add(m.mapKs,   "map_Ks");
         add(m.mapD,    "map_d");
         add(m.mapBump, "map_Bump");
+        add(m.mapKe,   "map_Ke");
+        add(m.mapTr,   "map_Tr");
     }
 
     result->textures.reserve(refs.size());
@@ -158,6 +182,16 @@ void buildTextureRefs(
         pt.resolvedPath = result->sourceDir.empty()
             ? std::string(r.path)
             : result->sourceDir + "/" + std::string(r.path);
+        if (loadBytes) {
+            if (auto mf = MappedFile::openShared(pt.resolvedPath)) {
+                pt.data = mf->bytes();
+                pt.byteSize = mf->size();
+                result->textureFiles.push_back(std::move(mf));
+            } else {
+                owner.addWarning(std::string("texture not found: ")
+                                + pt.resolvedPath);
+            }
+        }
         result->textures.push_back(pt);
     }
 
@@ -180,11 +214,19 @@ void bindMaterials(
     for (int i = 0; i < int(result->materials.size()); ++i)
         byName.emplace(result->materials[size_t(i)].name, i);
 
+    std::unordered_set<std::string_view> unresolved;
     for (PackMesh& m : result->meshes) {
         if (m.materialIndex < 0) continue;
         const std::string_view usemtl = (*mtlNames)[size_t(m.materialIndex)];
         const auto it = byName.find(usemtl);
-        m.materialIndex = it == byName.end() ? -1 : it->second;
+        if (it == byName.end()) {
+            m.materialIndex = -1;
+            if (unresolved.insert(usemtl).second)
+                owner.addWarning(std::string("usemtl '") +
+                                 std::string(usemtl) + "' has no matching newmtl");
+        } else {
+            m.materialIndex = it->second;
+        }
     }
     AP_LOG("materials", "bound usemtl -> material indices in %llu us",
            static_cast<unsigned long long>(microsSince(tStart)));

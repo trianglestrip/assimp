@@ -6,6 +6,11 @@
 
 namespace ap {
 
+void registerStlParser();   // defined in src/StlParser.cpp
+void registerPlyParser();   // defined in src/PlyParser.cpp
+void registerGltfParser();  // defined in src/GltfParser.cpp
+void registerFbxParser();   // defined in src/FbxParser.cpp
+
 // ---- ParserRegistry ----
 
 struct ParserRegistry::Impl {
@@ -93,6 +98,19 @@ void ModelParser::setOnTexturesReady(TexturesReady cb)   { onTexs_  = std::move(
 void ModelParser::setOnAllDone(AllDone cb)               { onAll_   = std::move(cb); }
 void ModelParser::setProgress(Progress cb)               { onProgress_ = std::move(cb); }
 
+void ModelParser::cancel() {
+    cancel_.store(true, std::memory_order_relaxed);
+}
+bool ModelParser::isCancelled() const {
+    return cancel_.load(std::memory_order_relaxed);
+}
+const std::vector<std::string>& ModelParser::warnings() const {
+    return warnings_;
+}
+void ModelParser::addWarning(std::string msg) {
+    warnings_.push_back(std::move(msg));
+}
+
 void ModelParser::fireVertices(PackResult& r, std::span<const PackMesh> m) const {
     if (onVerts_) onVerts_(r, m);
 }
@@ -128,7 +146,12 @@ void ModelParser::releaseGeometry() {
 
 AssetPack::AssetPack(unsigned threads)
     : threads_(threads) {
-    registerObjParser();   // keeps the unit linked in static builds
+    failResult_ = std::make_shared<PackResult>();
+    registerObjParser();    // keeps the unit linked in static builds
+    registerStlParser();    // additional format parsers (stl / ply)
+    registerPlyParser();
+    registerGltfParser();   // glTF 2.0 (.gltf / .glb)
+    registerFbxParser();    // binary FBX 7400+
 }
 
 AssetPack::~AssetPack() = default;
@@ -142,6 +165,15 @@ void AssetPack::setOnAllDone(AllDone cb)               { onAll_   = std::move(cb
 void AssetPack::setProgress(Progress cb)               { onProgress_ = std::move(cb); }
 void AssetPack::setGeoStream(GeoStreamSink sink)       { geoStream_ = std::move(sink); }
 void AssetPack::setWantNormals(bool want)              { wantNormals_ = want; }
+void AssetPack::setWantTexcoords(bool want)           { wantTexcoords_ = want; }
+void AssetPack::setWantPositions(bool want)           { wantPositions_ = want; }
+void AssetPack::setWantTextureBytes(bool want)        { wantTextureBytes_ = want; }
+
+void AssetPack::cancel() { if (parser_) parser_->cancel(); }
+const std::vector<std::string>& AssetPack::warnings() {
+    if (!parser_) { static const std::vector<std::string> empty; return empty; }
+    return parser_->warnings();
+}
 
 bool AssetPack::ensureParser(std::string_view path) {
     if (parser_) return true;
@@ -163,6 +195,9 @@ void AssetPack::attachCallbacks() {
     parser_->setProgress(onProgress_);
     parser_->setGeoStream(geoStream_);
     parser_->setWantNormals(wantNormals_);
+    parser_->setWantTexcoords(wantTexcoords_);
+    parser_->setWantPositions(wantPositions_);
+    parser_->setWantTextureBytes(wantTextureBytes_);
 }
 
 bool AssetPack::load(std::string_view path) {
@@ -173,17 +208,22 @@ bool AssetPack::load(std::string_view path) {
 
 void AssetPack::loadAsync(std::string_view path) {
     if (!ensureParser(path)) {
-        static PackResult empty;
         AP_LOG_WARN("pack", "loadAsync: no parser for '%.*s'",
                     int(path.size()), path.data());
-        if (onAll_) onAll_(empty, false, "no parser for format");
+        if (onAll_) onAll_(*failResult_, false, "no parser for format");
         return;
     }
     attachCallbacks();
     parser_->loadAsync(path);
 }
 
-PackResult& AssetPack::result() { return parser_->result(); }
+PackResult& AssetPack::result() {
+    if (!parser_) {
+        AP_LOG_WARN("pack", "result() with no active parser (load failed?)");
+        return *failResult_;
+    }
+    return parser_->result();
+}
 
 void AssetPack::releaseGeometry() {
     if (parser_) parser_->releaseGeometry();

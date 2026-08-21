@@ -116,9 +116,10 @@ std::vector<std::pair<size_t, size_t>> splitLineRanges(
 
 GeometryStage::GeometryStage(
     ObjParser& owner, std::shared_ptr<PackResult> result,
-    std::shared_ptr<std::vector<std::string_view>> mtlNames, bool wantNormals)
+    std::shared_ptr<std::vector<std::string_view>> mtlNames, bool wantNormals,
+    bool wantTexcoords)
     : owner_(owner), result_(std::move(result)), mtlNames_(std::move(mtlNames)),
-      wantN_(wantNormals),
+      wantN_(wantNormals), wantUv_(wantTexcoords),
       chunks_(std::make_shared<std::vector<ChunkInfo>>()),
       vnPool_(std::make_shared<std::vector<float>>()),
       uvPool_(std::make_shared<std::vector<float>>()),
@@ -130,7 +131,7 @@ GeometryStage::GeometryStage(
       texMats_(std::make_shared<std::unordered_set<std::string_view>>()) {}
 
 void GeometryStage::run(tf::Subflow& sf) {
-    if (!result_->objFile) return;
+    if (!result_->objFile || owner_.isCancelled()) return;
     const auto tStart = Clock::now();
     AP_LOG("geometry", "begin");
     const std::string_view text = result_->objFile->text();
@@ -184,11 +185,12 @@ void GeometryStage::run(tf::Subflow& sf) {
     });
 
     // pass 1 (parallel): per-chunk counts + ordered markers
-    tf::Task pass1 = sf.for_each_index(0, nChunks, 1, [chunks, data](int ci) {
+    tf::Task pass1 = sf.for_each_index(0, nChunks, 1, [chunks, data, this](int ci) {
         ChunkInfo& c = (*chunks)[size_t(ci)];
-        const char* p = data + c.begin;
-        const char* end = data + c.end;
-        while (p < end) {
+         const char* p = data + c.begin;
+         const char* end = data + c.end;
+         if (owner_.isCancelled()) return;
+         while (p < end) {
             const char* eol = static_cast<const char*>(
                 memchr(p, '\n', size_t(end - p)));
             if (!eol) eol = end;
@@ -220,6 +222,7 @@ void GeometryStage::run(tf::Subflow& sf) {
     tf::Task prefix = sf.emplace([chunks, result, vnPool, uvPool, vnIdx, uvIdx,
                                   nChunks, wantN, baseVerts, shards, tStart,
                                   this]() {
+        if (owner_.isCancelled()) return;
         AP_LOG("geometry", "pass1 done at %llu us",
                static_cast<unsigned long long>(microsSince(tStart)));
         size_t p = 0, n = 0, u = 0, t = 0;
@@ -228,6 +231,7 @@ void GeometryStage::run(tf::Subflow& sf) {
             c.basePos = p; c.baseNrm = n; c.baseUv = u; c.baseTri = t;
             p += c.nPos; n += c.nNrm; u += c.nUv; t += c.nTri;
         }
+        if (!wantUv_) u = 0;   // texcoords opt-out: drop the whole uv pool
         // geometry streaming: publish the buffer plan as soon as the
         // counts are known (the split count is still unknown, so files
         // with vt lines reserve one extra vertex per base vertex -
@@ -285,7 +289,8 @@ void GeometryStage::run(tf::Subflow& sf) {
     // the mtl parser would not bind a texture to must not split either.
     // Runs ahead of pass2 while the materials task (a sibling stage)
     // parses the same file in parallel; this only reads it.
-    tf::Task mtlTex = sf.emplace([result, texMats]() {
+    tf::Task mtlTex = sf.emplace([result, texMats, this]() {
+        if (owner_.isCancelled()) return;
         const std::shared_ptr<MappedFile>& mf = result->mtlFile;
         if (!mf) return;
         const std::string_view text = mf->text();
@@ -315,10 +320,11 @@ void GeometryStage::run(tf::Subflow& sf) {
     tf::Task pass2 = sf.for_each_index(0, nChunks, 1,
         [chunks, result, vnPool, uvPool, vnIdx, uvIdx, data, wantN,
          shards, seamCounter, baseVerts, texMats, this](int ci) {
-            ChunkInfo& c = (*chunks)[size_t(ci)];
-            const char* p = data + c.begin;
-            const char* end = data + c.end;
-            size_t lp = c.basePos, ln = c.baseNrm, lu = c.baseUv;
+         ChunkInfo& c = (*chunks)[size_t(ci)];
+         const char* p = data + c.begin;
+         const char* end = data + c.end;
+         if (owner_.isCancelled()) return;
+         size_t lp = c.basePos, ln = c.baseNrm, lu = c.baseUv;
             float* pos = result->positions.data();
             float* nrm = vnPool->data();
             float* uv  = uvPool->data();
@@ -355,10 +361,12 @@ void GeometryStage::run(tf::Subflow& sf) {
                     }
                     ++ln;
                 } else if (k == LineKind::VT) {
-                    q = p + 2;
-                    for (int comp = 0; comp < 2; ++comp) {
-                        if (!(q = nextToken(q, eol, tok, len))) break;
-                        uv[lu * 2 + comp] = parseFloat(tok, len);
+                    if (wantUv_) {
+                        q = p + 2;
+                        for (int comp = 0; comp < 2; ++comp) {
+                            if (!(q = nextToken(q, eol, tok, len))) break;
+                            uv[lu * 2 + comp] = parseFloat(tok, len);
+                        }
                     }
                     ++lu;
                 } else if (k == LineKind::UseMtl) {
@@ -460,6 +468,7 @@ void GeometryStage::run(tf::Subflow& sf) {
     tf::Task seamFill = sf.emplace([result, vnPool, uvPool, shards,
                                     seamCounter, baseVerts,
                                     this](tf::Subflow& inner) {
+        if (owner_.isCancelled()) return;
         const size_t base = *baseVerts;
         const size_t n = seamCounter->load();
         if (n) {
@@ -485,8 +494,9 @@ void GeometryStage::run(tf::Subflow& sf) {
         const float* up = uvPool->data();
         const bool wantNrm = !result->normals.empty();
         const bool wantUv = !result->texcoords.empty();
-        inner.for_each_index(0, int(total), 1, [&](int i) {
-            const auto& [idx, sv] = *entries[size_t(i)];
+         inner.for_each_index(0, int(total), 1, [&](int i) {
+             if (owner_.isCancelled()) return;
+             const auto& [idx, sv] = *entries[size_t(i)];
             // dst is always past base, src below it: no overlap
             const size_t d = size_t(idx) * 3, s = size_t(sv.v) * 3;
             pos[d] = pos[s];
@@ -555,6 +565,7 @@ void GeometryStage::run(tf::Subflow& sf) {
     tf::Task pass3 = sf.emplace(
         [result, vnIdx, uvIdx, vnPool, uvPool, chunks, nChunks, tStart,
          baseVerts, this](tf::Subflow& inner) {
+            if (owner_.isCancelled()) return;
             // base slots only: seam splits were filled directly by
             // seamFill, and vnIdx/uvIdx stop at the base count
             const int nVerts = int(*baseVerts);
@@ -567,8 +578,9 @@ void GeometryStage::run(tf::Subflow& sf) {
             inner.for_each_index(0, nChunks, 1,
                 [chunks, result, vnIdx, uvIdx, vnPool, uvPool,
                  this](int ci) {
-                    const ChunkInfo& c = (*chunks)[size_t(ci)];
-                    const size_t begin = c.basePos;
+                     if (owner_.isCancelled()) return;
+                     const ChunkInfo& c = (*chunks)[size_t(ci)];
+                     const size_t begin = c.basePos;
                     const size_t end = c.basePos + c.nPos;
                     const float* vn = vnPool->data();
                     const float* uv = uvPool->data();
@@ -620,6 +632,7 @@ void GeometryStage::run(tf::Subflow& sf) {
     // (per-group spans into the pools + per-group bounds) in parallel
     tf::Task build = sf.emplace([this, chunks, result, nChunks, mtlNames,
                                  tStart](tf::Subflow& inner) {
+        if (owner_.isCancelled()) { owner_.fireProgress(100.f); return; }
         std::vector<RawGroup> groups;
         RawGroup cur;
         cur.firstTriangle = 0;
@@ -690,8 +703,9 @@ void GeometryStage::run(tf::Subflow& sf) {
 
         // per-mesh bounds from the referenced pool vertices (parallel)
         const int n = int(result->meshes.size());
-        inner.for_each_index(0, n, 1, [result](int i) {
-            PackMesh& pm = result->meshes[size_t(i)];
+         inner.for_each_index(0, n, 1, [this, result](int i) {
+             if (owner_.isCancelled()) return;
+             PackMesh& pm = result->meshes[size_t(i)];
             float mn[3] = { std::numeric_limits<float>::max(),
                             std::numeric_limits<float>::max(),
                             std::numeric_limits<float>::max() };

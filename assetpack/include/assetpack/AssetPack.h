@@ -18,6 +18,7 @@
 // parser registry / AssetPack facade.
 // ============================================================
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -161,6 +162,12 @@ struct PackResult {
     // mappings own every string_view above; keep alive while views are in use
     std::shared_ptr<MappedFile> objFile;
     std::shared_ptr<MappedFile> mtlFile;    // OBJ/MTL parsers only
+    // when texture bytes are loaded, owns the mmap backing each
+    // PackTexture::data so the spans stay valid for this result's lifetime
+    std::vector<std::shared_ptr<MappedFile>> textureFiles;
+    // owns decoded embedded texture bytes (e.g. glTF data:- URIs); a
+    // PackTexture::data span points into the matching entry
+    std::vector<std::vector<std::byte>> embeddedTextures;
     std::string sourceDir;
 
     // global pools backing the PackMesh views
@@ -234,6 +241,22 @@ public:
     // the viewer uses positions/texcoords only). Parsers without the
     // section, or that cannot skip it, ignore the call.
     virtual void setWantNormals(bool want) { (void)want; }
+    virtual void setWantTexcoords(bool want) { (void)want; }
+    virtual void setWantPositions(bool want) { (void)want; }
+    virtual void setWantTextureBytes(bool want) { (void)want; }
+
+    // Request cancellation of an in-flight load (typically async). Parsers
+    // check between stages and bail, firing onAllDone(false, "cancelled").
+    void cancel();
+    bool isCancelled() const;
+
+    // Non-fatal issues from the last load (missing mtllib, unresolved
+    // materials, texture load failures, ...). Empty on a clean load.
+    const std::vector<std::string>& warnings() const;
+
+    // Parsers and their helpers record non-fatal issues via this; surfaced
+    // by warnings().
+    void addWarning(std::string msg);
 
     // Free the geometry pools after the consumer has uploaded them to
     // the GPU (or copied the data out). PackMesh views into the pools
@@ -262,6 +285,8 @@ protected:
     // lastError_; the events above hand consumers views into it.
     std::shared_ptr<PackResult> result_;
     std::string lastError_;
+    std::vector<std::string> warnings_;
+    std::atomic<bool> cancel_{false};
 
 private:
     VerticesReady  onVerts_;
@@ -347,6 +372,13 @@ public:
     // Parser attribute opt-outs (applied to the parser the facade
     // creates; ignored by parsers without the section)
     void setWantNormals(bool want);
+    void setWantTexcoords(bool want);
+    void setWantPositions(bool want);
+    void setWantTextureBytes(bool want);
+
+    // Cancel an in-flight load and query non-fatal warnings.
+    void cancel();
+    const std::vector<std::string>& warnings();
 
     // Forwarded to the parser: frees the geometry pools once the
     // consumer has uploaded them (see ModelParser::releaseGeometry).
@@ -365,8 +397,12 @@ private:
 
     unsigned threads_;
     bool wantNormals_ = true;
+    bool wantTexcoords_ = true;
+    bool wantPositions_ = true;
+    bool wantTextureBytes_ = false;
     std::string format_;
     std::unique_ptr<ModelParser> parser_;
+    std::shared_ptr<PackResult> failResult_;   // returned when no parser is active
 
     VerticesReady  onVerts_;
     MaterialsReady onMats_;

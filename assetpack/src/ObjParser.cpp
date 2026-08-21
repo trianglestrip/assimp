@@ -49,6 +49,8 @@ void ObjParser::loadAsync(std::string_view path) { runGraph(path, true); }
 bool ObjParser::runGraph(std::string_view path, bool async) {
     result_ = std::make_shared<PackResult>();
     lastError_.clear();
+    warnings_.clear();
+    cancel_.store(false, std::memory_order_relaxed);
 
     auto flow = std::shared_ptr<void>(new tf::Taskflow, FlowDeleter{});
     flow_ = flow; // keep alive for async completion
@@ -61,6 +63,7 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
 
     // ---- stage 1: mmap obj + quick mtllib head-scan ----
     tf::Task mapTask = tf.emplace([this, pathStr]() {
+        if (isCancelled()) { lastError_ = "cancelled"; return; }
         const auto tStart = Clock::now();
         PackResult& result = *result_;
         result.objFile = MappedFile::openShared(*pathStr);
@@ -89,8 +92,10 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
                     std::string full = result.sourceDir.empty()
                         ? mtlPath : result.sourceDir + "/" + mtlPath;
                     result.mtlFile = MappedFile::openShared(full);
-                    if (!result.mtlFile)
+                    if (!result.mtlFile) {
                         AP_LOG_WARN("obj", "mtllib '%s' not found", mtlPath.c_str());
+                        addWarning(std::string("mtllib '") + mtlPath + "' not found");
+                    }
                     else
                         AP_LOG("obj", "mtl mapped: %s (%zu bytes)",
                                mtlPath.c_str(), result.mtlFile->size());
@@ -107,22 +112,25 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
 
     // ---- stage 2a: geometry (chunk-parallel two-pass + seam split) ----
     auto geo = std::make_shared<obj::GeometryStage>(*this, result_, mtlNames,
-                                                    wantNormals_);
+                                                     wantNormals_, wantUv_);
     tf::Task geometryTask =
         tf.emplace([geo](tf::Subflow& sf) { geo->run(sf); });
 
     // ---- stage 2b: materials (parse + convert, parallel to geometry) ----
     tf::Task materialsTask = tf.emplace([this, rawMats]() {
+        if (isCancelled()) return;
         obj::parseMtl(result_, rawMats);
     });
 
     // ---- stage 2c: textures (from materials) ----
     tf::Task texturesTask = tf.emplace([this, rawMats]() {
-        obj::buildTextureRefs(*this, result_, rawMats);
+        if (isCancelled()) return;
+        obj::buildTextureRefs(*this, result_, rawMats, wantTextureBytes_);
     });
 
     // ---- stage 2d: bind usemtl -> material index, then fire materials ----
     tf::Task bindTask = tf.emplace([this, mtlNames]() {
+        if (isCancelled()) return;
         obj::bindMaterials(*this, result_, mtlNames);
     });
 
@@ -130,7 +138,11 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
     tf::Task doneTask = tf.emplace([this, t0]() {
         PackResult& result = *result_;
         result.totalMicros = microsSince(t0);
-        const bool ok = result.objFile != nullptr;
+        const bool cancelled = isCancelled();
+        const bool ok = result.objFile != nullptr && !cancelled;
+        std::string_view err = ok ? std::string_view{}
+                                  : (cancelled ? std::string_view("cancelled")
+                                               : std::string_view(lastError_));
         AP_LOG("done", "%s total %llu us (geometry %llu / pack %llu / "
                "materials %llu / textures %llu)",
                ok ? "OK" : "FAILED",
@@ -139,9 +151,7 @@ bool ObjParser::runGraph(std::string_view path, bool async) {
                static_cast<unsigned long long>(result.verticesMicros),
                static_cast<unsigned long long>(result.materialsMicros),
                static_cast<unsigned long long>(result.texturesMicros));
-        fireAllDone(result, ok,
-                    ok ? std::string_view{}
-                       : std::string_view(lastError_));
+        fireAllDone(result, ok, err);
         AP_LOG("event", "onAllDone fired");
     });
 

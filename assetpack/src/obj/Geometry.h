@@ -31,7 +31,7 @@ public:
     GeometryStage(ObjParser& owner,
                   std::shared_ptr<PackResult> result,
                   std::shared_ptr<std::vector<std::string_view>> mtlNames,
-                  bool wantNormals);
+                  bool wantNormals, bool wantTexcoords);
 
     // build the geometry subflow into `sf`; fires progress/vertices
     // events through the owner when the build task completes
@@ -42,6 +42,7 @@ private:
     std::shared_ptr<PackResult> result_;
     std::shared_ptr<std::vector<std::string_view>> mtlNames_;
     const bool wantN_;
+    const bool wantUv_;
 
     // shared state across the subflow's tasks
     std::shared_ptr<std::vector<ChunkInfo>> chunks_;

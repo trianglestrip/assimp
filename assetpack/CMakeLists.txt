@@ -15,16 +15,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(assetpack
     src/AssetPack.cpp
     src/ObjParser.cpp
+    src/StlParser.cpp
+    src/PlyParser.cpp
     src/MappedFile.cpp
     src/Log.cpp
     src/obj/Scan.cpp
     src/obj/Geometry.cpp
     src/obj/Mtl.cpp
+    src/GltfParser.cpp
+    src/FbxParser.cpp
 )
 target_include_directories(assetpack
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src           # detail/ obj/ 内部头
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party   # <taskflow/taskflow.hpp>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rapidjson/include  # glTF JSON
 )
 target_compile_features(assetpack PUBLIC cxx_std_20)
 
@@ -107,6 +112,17 @@ if(ASSETPACK_WITH_VIEWER)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${SDL2_ROOT}/lib/x64/SDL2.dll" $<TARGET_FILE_DIR:assetpack_viewer>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pix/lib/x64/WinPixEventRuntime.dll"
-                $<TARGET_FILE_DIR:assetpack_viewer>)
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pix/lib/x64/WinPixEventRuntime.dll"
+                 $<TARGET_FILE_DIR:assetpack_viewer>)
+endif()
+
+# ---- unit tests (dependency-free, self-contained harness) ----
+add_executable(assetpack_tests test/assetpack_tests.cpp)
+target_include_directories(assetpack_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(assetpack_tests PRIVATE assetpack)
+if(MSVC)
+    target_compile_options(assetpack_tests PRIVATE /W4 /permissive- /utf-8)
 endif()

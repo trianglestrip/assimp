@@ -41,6 +41,8 @@ public:
     // parse, the per-vertex normal expansion arrays and the expanded
     // output. Default true (behavior unchanged).
     void setWantNormals(bool want) override { wantNormals_ = want; }
+    void setWantTexcoords(bool want) override { wantUv_ = want; }
+    void setWantTextureBytes(bool want) override { wantTextureBytes_ = want; }
 
     bool load(std::string_view path) override;
     void loadAsync(std::string_view path) override;
@@ -61,6 +63,8 @@ private:
     std::unique_ptr<tf::Executor> executor_;
     std::shared_ptr<void> flow_;      // tf::Taskflow, type-erased
     bool wantNormals_ = true;
+    bool wantUv_ = true;
+    bool wantTextureBytes_ = false;
 };
 
 } // namespace ap

@@ -11,6 +11,13 @@
 #endif
 #include <Windows.h>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 
 namespace ap {
@@ -18,12 +25,19 @@ namespace ap {
 MappedFile::~MappedFile() { close(); }
 
 void MappedFile::close() {
+#ifdef _WIN32
     if (base_)    { ::UnmapViewOfFile(base_); base_ = nullptr; }
     if (mapping_) { ::CloseHandle(static_cast<HANDLE>(mapping_)); mapping_ = nullptr; }
     if (file_)    { ::CloseHandle(static_cast<HANDLE>(file_)); file_ = nullptr; }
+#else
+    if (base_)    { ::munmap(base_, bytes_.size()); base_ = nullptr; }
+    if (file_)    { ::close(static_cast<int>(reinterpret_cast<intptr_t>(file_))); file_ = nullptr; }
+    mapping_ = nullptr;
+#endif
     bytes_ = {};
 }
 
+#ifdef _WIN32
 bool MappedFile::open(std::string_view path) {
     close();
     if (path.empty()) return false;
@@ -60,6 +74,37 @@ bool MappedFile::open(std::string_view path) {
                  static_cast<size_t>(sz.QuadPart) };
     return true;
 }
+
+#else
+bool MappedFile::open(std::string_view path) {
+    close();
+    if (path.empty()) return false;
+
+    const std::string p(path);
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || st.st_size == 0) {
+        ::close(fd);
+        return false;
+    }
+
+    void* base = ::mmap(nullptr, static_cast<size_t>(st.st_size),
+                        PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) {
+        ::close(fd);
+        return false;
+    }
+
+    file_    = reinterpret_cast<void*>(static_cast<intptr_t>(fd));
+    mapping_ = nullptr;
+    base_    = base;
+    bytes_   = { static_cast<const std::byte*>(base),
+                 static_cast<size_t>(st.st_size) };
+    return true;
+}
+#endif
 
 std::shared_ptr<MappedFile> MappedFile::openShared(std::string_view path) {
     auto f = std::make_shared<MappedFile>();
@@ -107,4 +152,4 @@ bool MappedFile::prefetch(size_t offset, size_t len) const {
 #endif
 }
 
-} // namespace ag
+} // namespace ap

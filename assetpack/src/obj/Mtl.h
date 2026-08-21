@@ -25,8 +25,11 @@ struct RawMaterial {
     float Ns = 10.f;
     float d = 1.f;                  // dissolve (alpha)
     int32_t illum = 1;
+    float Ke[3] = {0.f, 0.f, 0.f};  // emissive color
+    float Tr = 0.f;                 // transmission (0 opaque, 1 transparent)
+    bool hasTr = false;             // set true only when a Tr token is parsed
     // texture refs (views into mtl mapping; empty when absent)
-    std::string_view mapKd, mapKa, mapKs, mapD, mapBump;
+    std::string_view mapKd, mapKa, mapKs, mapD, mapBump, mapKe, mapTr;
 };
 
 // parse the mapped .mtl into raw records + the public material list;
@@ -38,7 +41,8 @@ void parseMtl(const std::shared_ptr<PackResult>& result,
 // texture list; fires onTexturesReady through the owner
 void buildTextureRefs(ObjParser& owner,
                       const std::shared_ptr<PackResult>& result,
-                      const std::shared_ptr<std::vector<RawMaterial>>& rawMats);
+                      const std::shared_ptr<std::vector<RawMaterial>>& rawMats,
+                      bool loadBytes = false);
 
 // rewrite each mesh's temporary first-seen materialIndex into the
 // real materials-array index; fires onMaterialsReady
