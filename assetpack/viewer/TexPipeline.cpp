@@ -1,9 +1,9 @@
 #include "TexPipeline.h"
 #include <assetpack/AssetPack.h>
+#include "../src/core/TaskExecutor.h"
+#include <taskflow/algorithm/for_each.hpp>
 
 #include <algorithm>
-#include <condition_variable>
-#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -18,7 +18,7 @@
 namespace texp {
 
 namespace {
- // deleter for stb's malloc'd decode output (kept out of the header)
+// deleter for stb's malloc'd decode output (kept out of the header)
 void stbiFree(void* p) { stbi_image_free(p); }
 
 #ifdef _WIN32
@@ -32,9 +32,7 @@ bool tryDecodeWIC(const uint8_t* data, size_t size, int* w, int* h,
         if (FAILED(hr) || !factory) return false;
     }
     IStream* stream = SHCreateMemStream(data, UINT(size));
-    if (!stream) {
-        return false;
-    }
+    if (!stream) return false;
     IWICBitmapDecoder* decoder = nullptr;
     HRESULT hr = factory->CreateDecoderFromStream(
         stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
@@ -127,10 +125,69 @@ void TexPipeline::releaseSlots(size_t from, size_t to) {
 }
 
 TexPipeline::~TexPipeline() {
-    // guarantee the worker can never block join() on an unset finish
-    finished_.store(true, std::memory_order_release);
-    qCv_.notify_all();
-    if (worker_.joinable()) worker_.join();
+    finish();
+}
+
+void TexPipeline::advancePrefix() {
+    size_t cur = ready_.load(std::memory_order_acquire);
+    while (cur < total_.load() &&
+           slotDone_[cur].load(std::memory_order_acquire)) {
+        const size_t want = cur + 1;
+        if (ready_.compare_exchange_strong(cur, want,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+            if (diffuseQ_[cur].diffuse) {
+                std::lock_guard<std::mutex> plk(pathMx_);
+                byPath_.emplace(diffuseQ_[cur].key, int(cur));
+            }
+            cur = ready_.load(std::memory_order_acquire);
+        } else {
+            cur = ready_.load(std::memory_order_acquire);
+        }
+    }
+}
+
+void TexPipeline::decodeOne(const Ref& t, size_t slot) {
+#ifdef _WIN32
+    thread_local bool coInited = [] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        return true;
+    }();
+    (void)coInited;
+#endif
+    auto mf = ap::MappedFile::openShared(t.resolved);
+    if (!mf) return;
+    mf->prefetch(0, mf->size());
+    bytesMapped += mf->size();
+    ++filesMapped;
+    int w = 0, h = 0, ch = 0;
+    unsigned char* rgba = nullptr;
+#ifdef _WIN32
+    if (!tryDecodeWIC(reinterpret_cast<const uint8_t*>(mf->bytes().data()),
+                      mf->size(), &w, &h, &rgba)) {
+        rgba = nullptr;
+    }
+#endif
+    if (!rgba) {
+        rgba = stbi_load_from_memory(
+            reinterpret_cast<const unsigned char*>(mf->bytes().data()),
+            int(mf->size()), &w, &h, &ch, 4);
+    }
+    if (!rgba) {
+        AP_LOG_WARN("tex", "decode failed: %s", t.key.c_str());
+        return;
+    }
+    DecodedTex dt;
+    dt.w = w;
+    dt.h = h;
+    dt.rgba = {rgba, &stbiFree};
+    pixels += size_t(w) * size_t(h);
+    {
+        std::lock_guard<std::mutex> lk(qMx_);
+        texs_[slot] = std::move(dt);
+        slotDone_[slot].store(1, std::memory_order_release);
+        advancePrefix();
+    }
 }
 
 void TexPipeline::enqueue(std::span<const ap::PackTexture> texs) {
@@ -143,12 +200,13 @@ void TexPipeline::enqueue(std::span<const ap::PackTexture> texs) {
         (diff ? nd : no).push_back(std::move(r));
     }
     if (nd.empty() && no.empty()) return;
+    size_t old = 0, need = 0;
     {
         std::lock_guard<std::mutex> lk(qMx_);
-        const size_t old = texs_.size();
+        old = texs_.size();
         for (auto& r : nd) diffuseQ_.push_back(std::move(r));
         for (auto& r : no) othersQ_.push_back(std::move(r));
-        const size_t need = diffuseQ_.size();
+        need = diffuseQ_.size();
         if (need > old) {
             texs_.resize(need);
             auto nsd = std::make_unique<std::atomic<uint8_t>[]>(need);
@@ -161,143 +219,49 @@ void TexPipeline::enqueue(std::span<const ap::PackTexture> texs) {
         }
         total_.store(need, std::memory_order_release);
     }
-    qCv_.notify_all();
-    if (!running_.exchange(true))
-        worker_ = std::thread([this]() { runDecodeLoop(); });
+    // stat-only others: just mmap for counters (cheap)
+    for (auto& r : no) {
+        auto mf = ap::MappedFile::openShared(r.resolved);
+        if (mf) {
+            bytesMapped += mf->size();
+            ++filesMapped;
+        }
+    }
+    if (nd.empty()) return;
+    // dispatch diffuse decodes as a taskflow on the shared global executor
+    // so PbrtParser's ply loads and texture decodes share the same pool
+    tf::Taskflow flow;
+    flow.for_each_index(int(old), int(need), 1,
+                        [&](int idx) { decodeOne(diffuseQ_[size_t(idx)], size_t(idx)); });
+    auto fut = ap::globalExecutor().run(std::move(flow));
+    {
+        std::lock_guard<std::mutex> lk(qMx_);
+        futures_.push_back(std::move(fut));
+    }
+    // done_ will be set in finish() after all futures complete
 }
 
 void TexPipeline::finish() {
-    finished_.store(true, std::memory_order_release);
-    qCv_.notify_all();
-}
-
-void TexPipeline::runDecodeLoop() {
-    const unsigned n = std::max(1u, std::thread::hardware_concurrency());
-
-    // caller must hold qMx_: publishes the longest contiguous decoded
-    // prefix so consumers only ever see a prefix, never holes
-    auto advancePrefix = [&]() {
-        size_t cur = ready_.load(std::memory_order_acquire);
-        while (cur < total_.load() &&
-               slotDone_[cur].load(std::memory_order_acquire)) {
-            const size_t want = cur + 1;
-            if (ready_.compare_exchange_strong(cur, want,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_relaxed)) {
-                if (diffuseQ_[cur].diffuse) {
-                    std::lock_guard<std::mutex> plk(pathMx_);
-                    byPath_.emplace(diffuseQ_[cur].key, int(cur));
-                }
-                cur = ready_.load(std::memory_order_acquire);
-            } else {
-                cur = ready_.load(std::memory_order_acquire);
-            }
-        }
-    };
-
-    auto decodeOne = [&](const Ref& t, size_t slot) {
-        auto mf = ap::MappedFile::openShared(t.resolved);
-        if (!mf) return;
-        // hint OS to bring pages in (cheap when cached, helps when cold)
-        mf->prefetch(0, mf->size());
-        bytesMapped += mf->size();
-        ++filesMapped;
-        int w = 0, h = 0, ch = 0;
-        unsigned char* rgba = nullptr;
-#ifdef _WIN32
-        // WIC (Windows Imaging Component) uses hardware-accelerated
-        // codecs and is significantly faster than stb for PNG/JPEG.
-        // Try it first, fall back to stb.
-        if (!tryDecodeWIC(
-                reinterpret_cast<const uint8_t*>(mf->bytes().data()),
-                mf->size(), &w, &h, &rgba)) {
-            rgba = nullptr;
-        }
-#endif
-        if (!rgba) {
-            // stb fallback (also handles cases WIC cannot)
-            rgba = stbi_load_from_memory(
-                reinterpret_cast<const unsigned char*>(mf->bytes().data()),
-                int(mf->size()), &w, &h, &ch, 4);
-        }
-        if (!rgba) {
-            AP_LOG_WARN("tex", "decode failed: %s", t.key.c_str());
-            return;
-        }
-        DecodedTex dt;
-        dt.w = w;
-        dt.h = h;
-        dt.rgba = {rgba, &stbiFree};
-        // publish under qMx_ so queue growth (which also holds qMx_)
-        // can never race with this write
+    std::vector<tf::Future<void>> local;
+    {
+        std::lock_guard<std::mutex> lk(qMx_);
+        local = std::move(futures_);
+        futures_.clear();
+    }
+    for (auto& f : local) f.wait();
+    // ensure any still-pending enqueues that raced with this finish are also drained
+    // (enqueue may have added new futures after we moved)
+    while (true) {
+        std::vector<tf::Future<void>> more;
         {
             std::lock_guard<std::mutex> lk(qMx_);
-            texs_[slot] = std::move(dt);
-            slotDone_[slot].store(1, std::memory_order_release);
-            advancePrefix();
+            if (futures_.empty()) break;
+            more = std::move(futures_);
+            futures_.clear();
         }
-    };
-
-    std::vector<std::thread> pool;
-    pool.reserve(n);
-    for (unsigned tid = 0; tid < n; ++tid) {
-        pool.emplace_back([&, tid]() {
-            (void)tid; // strided assignment keeps completion even; here we
-                       // claim the next free slot under the lock instead
-#ifdef _WIN32
-            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-#endif
-            for (;;) {
-                Ref r;
-                bool isDiff = false, isOther = false;
-                size_t j = 0, k = 0;
-                {
-                    std::lock_guard<std::mutex> lk(qMx_);
-                    if (diffuseCur_ < diffuseQ_.size()) {
-                        j = diffuseCur_++;
-                        r = diffuseQ_[j];
-                        isDiff = true;
-                    } else if (othersCur_ < othersQ_.size()) {
-                        k = othersCur_++;
-                        r = othersQ_[k];
-                        isOther = true;
-                    }
-                }
-                if (isDiff) {
-                    decodeOne(r, j);
-                    continue;
-                }
-                if (isOther) {
-                    // stat-only mmap for non-diffuse refs (normals etc.)
-                    auto mf = ap::MappedFile::openShared(r.resolved);
-                    if (mf) {
-                        bytesMapped += mf->size();
-                        ++filesMapped;
-                    }
-                    continue;
-                }
-                // nothing claimable right now
-                if (finished_.load(std::memory_order_acquire)) {
-                    std::lock_guard<std::mutex> lk(qMx_);
-                    if (diffuseCur_ >= diffuseQ_.size() &&
-                        othersCur_ >= othersQ_.size())
-                        break;
-                }
-                std::unique_lock<std::mutex> lk(qMx_);
-                qCv_.wait(lk, [&] {
-                    return (diffuseCur_ < diffuseQ_.size()) ||
-                           (othersCur_ < othersQ_.size()) ||
-                           finished_.load(std::memory_order_acquire);
-                });
-            }
-#ifdef _WIN32
-            CoUninitialize();
-#endif
-        });
+        for (auto& f : more) f.wait();
     }
-    for (auto& th : pool) th.join();
     done_.store(true, std::memory_order_release);
-    running_.store(false, std::memory_order_release);
 }
 
 } // namespace texp

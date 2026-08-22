@@ -308,3 +308,17 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
 | 2026-08-23 01:33:35 | [async] textures-queued | 0.0 ms | refs 254 |
 | 2026-08-23 01:33:35 | [async] all-done | 0.0 ms | + 9740.3 ms | import 0.0 ms, total 0.0 ms |
 | 2026-08-23 01:33:35 | bistro_cafe.pbrt | 30 | 51.1 | 19.6 | ALL | 1 |
+
+## taskflow 统一调度 + GPU CTM 完全体 -- 2026-08-23 01:42:58
+- 新增 src/core/TaskExecutor.h: 全局 tf::Executor 单例 (HC 线程)，PbrtParser ply 并行
+  与 TexPipeline 解码共享同一池，避免双池 2*HC 抢核；PbrtParser 改用
+  globalExecutor().run(flow).wait()，TexPipeline enqueue 改为 taskflow for_each
+  提交到同一池，finish() 等待 futures。
+- CPU 零变换完成：PbrtParser emitMesh/appendPacked 均已去逐顶点
+  matTransformPoint/Normal，位置/法线存局部，世界矩阵 world[16] + 法线矩阵
+  normalWorld[9] 随 MeshMeta/PackMesh/DrawItem 传递，DxRenderer b2 常量
+  每 draw 设置，VS 中 mul(float4(v.pos,1), g_world)。
+  材质合并仍不做（同前），纹理预算保持 32 自适应预留。
+
+验证：91/91 通过；bistro 端到端受温控波动大，交替 A/B 仍显示纹理解码
+与几何共享池后无额外争抢，ply 阶段保持 0.4-0.5s 基线。

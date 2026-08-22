@@ -33,6 +33,7 @@
 
 #include <taskflow/algorithm/for_each.hpp>   // parallel deferred .ply loading
 #include <taskflow/taskflow.hpp>
+#include "../../core/TaskExecutor.h"
 
 #include <algorithm>
 #include <array>
@@ -1064,7 +1065,7 @@ bool PbrtParser::load(std::string_view path) {
             // slice under the pool lock so appends stay ordered and the
             // published offsets line up with the final pool layout
             std::mutex poolMx;
-            tf::Executor exec(workers > 16 ? 16 : workers);
+            auto& exec = ap::globalExecutor();
             tf::Taskflow flow;
             flow.for_each_index(0, int(deferredPly_.size()), 1,
                                 [&](int i) {
@@ -1098,7 +1099,7 @@ bool PbrtParser::load(std::string_view path) {
             // support, or --nostream): load all, then concat, then let the
             // viewer do one blocking setGeometry ----
             if (workers > 1 && deferredPly_.size() > 1) {
-                tf::Executor exec(workers > 16 ? 16 : workers);
+                auto& exec = ap::globalExecutor();
                 tf::Taskflow flow;
                 flow.for_each_index(0, int(deferredPly_.size()), 1,
                                     [&](int i) {

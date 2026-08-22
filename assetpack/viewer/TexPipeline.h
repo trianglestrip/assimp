@@ -20,9 +20,9 @@
 #include <mutex>
 #include <span>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
+#include <taskflow/taskflow.hpp>
 
 namespace texp {
 
@@ -83,22 +83,18 @@ private:
         std::string resolved; // absolute file path to mmap
         bool        diffuse = true;
     };
-    void runDecodeLoop();
+    void decodeOne(const Ref& t, size_t slot);
+    void advancePrefix();
 
     std::vector<Ref> diffuseQ_;   // decoded + uploaded
-    std::vector<Ref> othersQ_;    // normals etc., stat-only
-    std::atomic<size_t> diffuseCur_{0};
-    std::atomic<size_t> othersCur_{0};
+    std::vector<Ref> othersQ_;    // normals etc., stat-only (stat-mmap only)
     std::vector<DecodedTex> texs_;   // sized to diffuseQ_.size()
     std::atomic<size_t> total_{0};   // == diffuseQ_.size()
     std::unique_ptr<std::atomic<uint8_t>[]> slotDone_;
     std::atomic<size_t> ready_{0};   // longest decoded prefix
     std::atomic<bool> done_{false};
-    std::atomic<bool> finished_{false};  // no more enqueues coming
-    std::atomic<bool> running_{false};
-    std::thread worker_;
-    std::mutex qMx_;               // guards queues + texs_/slotDone_ growth
-    std::condition_variable qCv_;
+    std::mutex qMx_;               // guards queues + texs_/slotDone_ growth + futures
+    std::vector<tf::Future<void>> futures_;
     mutable std::mutex pathMx_;    // guards byPath_
     std::unordered_map<std::string_view, int> byPath_;
 };
