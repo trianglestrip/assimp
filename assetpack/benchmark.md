@@ -343,3 +343,17 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
 - 纹理预算自适应：drawScene texBudget 32 改为 frameMs 反馈（gpuTiming <16.6ms 增大，>16.6ms 减小）
 - 绘制：1591 draws 已按 texSlot 排序，材质合并因 index/world/bounds 唯一不做
 - 几何：ply 已并行+流式+GPU CTM，剩余可做顶点量化/压缩（meshopt）运行时
+| 2026-08-23 02:15:28 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 02:15:28 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 02:15:28 | [async] textures-queued | 0.0 ms | refs 254 |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 02:15:28 | bistro_cafe.pbrt | 5 | 59.1 | 16.9 | ALL | 1 |
+| 2026-08-23 02:15:33 | [async] all-done | 0.0 ms | + 18242.1 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 02:16:03 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 02:16:03 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 02:16:03 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 02:16:03 | bistro_cafe.pbrt | 5 | 45.1 | 22.2 | ALL | 1 |
+| 2026-08-23 02:16:07 | [async] all-done | 0.0 ms | + 20451.8 ms | import 0.0 ms, total 0.0 ms |

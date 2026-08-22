@@ -118,6 +118,11 @@ float g_offY = 0.f;                        // Q/E world-space camera height
 bool g_cullFrontZ = true;                  // true: CCW front faces have +z winding
 bool g_autoRotate = false;                 // --autoRotate: orbit yaw each frame
 bool g_nostream = false;                   // --nostream: blocking setGeometry upload
+bool g_useSceneCamera = false;             // --useSceneCamera: initial camera from file
+bool g_useSceneLights = false;             // --useSceneLights: use file lights
+std::vector<ap::PackCamera> g_cameras;     // scene cameras snapshot
+std::vector<ap::PackLight> g_lights;       // scene lights snapshot
+int g_activeCamera = -1;
 
 // parser pool pointers captured at onVerticesReady (the pack outlives the
 // frame loop, so they stay valid); DxRenderer stages its geometry straight
@@ -429,6 +434,12 @@ static void buildUi(double fpsNow) {
     if (g_texPipe.count() > 0)
         ImGui::Text("%zu/%zu textures%s", g_texPipe.readyCount(),
                     g_texPipe.count(), g_noTex.load() ? " (off)" : "");
+    ImGui::Checkbox("Use scene camera", &g_useSceneCamera);
+    ImGui::Checkbox("Use scene lights", &g_useSceneLights);
+    if (!g_cameras.empty())
+        ImGui::Text("%zu cameras%s", g_cameras.size(), g_useSceneCamera ? " (active)" : "");
+    if (!g_lights.empty())
+        ImGui::Text("%zu lights%s", g_lights.size(), g_useSceneLights ? " (using file)" : " (default)");
     ImGui::Separator();
     ImGui::TextDisabled(
         "drag orbit | wheel zoom | WASD move | Q/E height | T tex | Esc quit");
@@ -653,6 +664,30 @@ static void bindEvents(ap::AssetPack& pack) {
         g_importMs = double(r.importMicros) / 1000.0;
         g_totalMs = double(r.totalMicros) / 1000.0;
         const double deltaMs = secsSince(g_tLoad) * 1000.0;
+        g_cameras.assign(r.cameras.begin(), r.cameras.end());
+        g_lights.assign(r.lights.begin(), r.lights.end());
+        g_activeCamera = r.activeCamera;
+        if (g_useSceneCamera && !g_cameras.empty() && g_activeCamera >=0 &&
+            size_t(g_activeCamera) < g_cameras.size()) {
+            const auto& c = g_cameras[size_t(g_activeCamera)];
+            float dir[3] = {c.target[0]-c.position[0], c.target[1]-c.position[1], c.target[2]-c.position[2]};
+            float dist = std::sqrt(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
+            if (dist > 1e-4f) {
+                g_rotY = std::atan2(dir[0], dir[2]);
+                g_pitch = std::asin(dir[1]/dist);
+                if (g_pitch > 1.4f) g_pitch = 1.4f;
+                if (g_pitch < -1.4f) g_pitch = -1.4f;
+                g_camDist = dist;
+                g_center[0]=c.target[0]; g_center[1]=c.target[1]; g_center[2]=c.target[2];
+                AP_LOG("viewer", "scene camera '%.*s' -> yaw %.2f pitch %.2f dist %.2f fov %.1f",
+                       int(c.name.size()), c.name.data(), g_rotY, g_pitch, g_camDist, c.fovYDegrees);
+            }
+        }
+        if (g_useSceneLights) {
+            AP_LOG("viewer", "scene lights: %zu (using file)", g_lights.size());
+        } else if (!g_lights.empty()) {
+            AP_LOG("viewer", "scene lights: %zu (ignored, default)", g_lights.size());
+        }
         g_allDone.store(true);
         // no further texture references will arrive; let the decode
         // worker drain and exit
@@ -755,6 +790,12 @@ int main(int argc, char** argv) {
             g_autoRotate = true;          // orbit the model each frame
         } else if (a == "--nostream") {
             g_nostream = true;            // A/B: blocking setGeometry upload
+        } else if (a == "--useSceneCamera") {
+            g_useSceneCamera = true;
+        } else if (a == "--useSceneLights") {
+            g_useSceneLights = true;
+        } else if (a == "--useScene") {
+            g_useSceneCamera = g_useSceneLights = true;
         } else if (a == "--camDist" && i + 1 < argc) {
             g_camDist = float(std::atof(argv[++i]));   // allow < 0.15 (inside)
         } else if (a == "--renderer" && i + 1 < argc) {

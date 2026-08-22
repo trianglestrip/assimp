@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -119,8 +120,15 @@ char decodeEscape(char c) {
 bool isQuoted(const std::string& s) {
     return s.size() >= 2 && s.front() == '"' && s.back() == '"';
 }
+inline bool isQuoted(std::string_view s) {
+    return s.size() >= 2 && s.front() == '"' && s.back() == '"';
+}
 
 std::string dequote(const std::string& s) {
+    if (isQuoted(s)) return s.substr(1, s.size() - 2);
+    return s;
+}
+inline std::string_view dequoteView(std::string_view s) {
     if (isQuoted(s)) return s.substr(1, s.size() - 2);
     return s;
 }
@@ -197,19 +205,24 @@ private:
     };
     std::vector<FileState> files_;
     std::optional<std::string> ungot_;
+    std::optional<std::string_view> ungotView_;
+    std::string dequotedViewBuf_;
     std::vector<std::shared_ptr<MappedFile>> openFiles_;
 
     std::optional<std::string> nextTokenRaw();
     std::optional<std::string> nextToken();
     std::optional<std::string> peek();
+    std::optional<std::string_view> nextTokenView();
+    std::optional<std::string_view> peekView();
+    std::optional<std::string_view> nextTokenViewRaw();
 
     void parseStream();
-    void dispatch(const std::string& stmt, const std::string& raw);
+    void dispatch(std::string_view low, std::string_view raw);
     ParamMap parseParams();
     std::string readName();
     float readFloat();
     Mat4 readMat16();
-    void expectToken(const char* lit);
+    void expectToken(std::string_view lit);
 
     void pushState();
     void popState();
@@ -220,7 +233,7 @@ private:
     void storeTexture(const std::string& name, const ParamMap& params);
     void storeNamedMaterial(const std::string& name, const ParamMap& params);
     void handleShape(const std::string& kind, const ParamMap& params);
-    void handleInclude(const std::string& filename);
+    void handleInclude(std::string_view filename);
     void handleCamera(const std::string& type, const ParamMap& params);
     void handleLight(const std::string& type, const ParamMap& params,
                      bool area);
@@ -292,7 +305,7 @@ private:
     std::string sourceDir_;
 };
 
-std::optional<std::string> PbrtParser::nextTokenRaw() {
+std::optional<std::string_view> PbrtParser::nextTokenViewRaw() {
     while (!files_.empty()) {
         auto& f = files_.back();
         const char* base = f.text.data();
@@ -304,94 +317,163 @@ std::optional<std::string> PbrtParser::nextTokenRaw() {
         if (*p == '#') { while (p < end && *p != '\n') p++; f.pos = size_t(p - base); continue; }
         const char* start = p;
         if (*p == '"') {
-            std::string out;
-            out.push_back('"');
-            p++;
-            while (p < end) {
-                if (*p == '\\') {
-                    if (p + 1 < end) { out.push_back(decodeEscape(*(p + 1))); p += 2; }
-                    else { out.push_back('"'); p++; break; }
-                } else if (*p == '"') { out.push_back('"'); p++; break; }
-                else { out.push_back(*p); p++; }
+            const char* q = p + 1;
+            bool hasEscape = false;
+            while (q < end) {
+                if (*q == '\\') { hasEscape = true; if (q + 1 < end) q += 2; else { q++; break; } }
+                else if (*q == '"') { q++; break; }
+                else q++;
             }
-            f.pos = size_t(p - base);
-            return out;
+            size_t len = size_t(q - start);
+            bool closed = (q > start && *(q - 1) == '"');
+            f.pos = size_t(q - base);
+            if (!hasEscape) {
+                return std::string_view(start, len);
+            }
+            dequotedViewBuf_.clear();
+            dequotedViewBuf_.reserve(len);
+            dequotedViewBuf_.push_back('"');
+            const char* innerEnd = closed ? q - 1 : q;
+            for (const char* r = start + 1; r < innerEnd; ) {
+                if (*r == '\\' && r + 1 < innerEnd) {
+                    dequotedViewBuf_.push_back(decodeEscape(*(r + 1)));
+                    r += 2;
+                } else {
+                    dequotedViewBuf_.push_back(*r);
+                    r++;
+                }
+            }
+            if (closed) dequotedViewBuf_.push_back('"');
+            return std::string_view(dequotedViewBuf_.data(), dequotedViewBuf_.size());
         }
         if (*p == '[' || *p == ']') {
-            std::string out(1, *p);
-            p++;
-            f.pos = size_t(p - base);
-            return out;
+            f.pos = size_t(p + 1 - base);
+            return std::string_view(p, 1);
         }
         while (p < end && *p != ' ' && *p != '\n' && *p != '\t' && *p != '\r' &&
                *p != '"' && *p != '[' && *p != ']')
             p++;
-        std::string out(start, p);
         f.pos = size_t(p - base);
-        return out;
+        return std::string_view(start, size_t(p - start));
     }
     return std::nullopt;
 }
 
+std::optional<std::string_view> PbrtParser::nextTokenView() {
+    if (ungotView_) { auto t = *ungotView_; ungotView_.reset(); return t; }
+    return nextTokenViewRaw();
+}
+
+std::optional<std::string_view> PbrtParser::peekView() {
+    if (!ungotView_) ungotView_ = nextTokenViewRaw();
+    return ungotView_;
+}
+
+// Compatibility wrappers: keep old string-based API by delegating to view
+std::optional<std::string> PbrtParser::nextTokenRaw() {
+    auto v = nextTokenView();
+    if (!v) return std::nullopt;
+    return std::string(*v);
+}
+
 std::optional<std::string> PbrtParser::nextToken() {
-    if (ungot_) { auto t = ungot_; ungot_.reset(); return t; }
-    return nextTokenRaw();
+    if (ungot_) { auto t = std::move(*ungot_); ungot_.reset(); return t; }
+    // prefer view cache if present (covers view path using old API)
+    if (ungotView_) { auto v = *ungotView_; ungotView_.reset(); return std::string(v); }
+    auto v = nextTokenViewRaw();
+    if (!v) return std::nullopt;
+    return std::string(*v);
 }
 
 std::optional<std::string> PbrtParser::peek() {
-    if (!ungot_) ungot_ = nextTokenRaw();
-    return ungot_;
+    if (ungot_) return ungot_;
+    if (ungotView_) return std::string(*ungotView_);
+    ungotView_ = nextTokenViewRaw();
+    if (!ungotView_) return std::nullopt;
+    return std::string(*ungotView_);
 }
 
 ParamMap PbrtParser::parseParams() {
     ParamMap out;
     while (true) {
-        auto t = peek();
+        auto t = peekView();
         if (!t) break;
         if (!isQuoted(*t)) break;
-        nextToken();
-        std::string decl = dequote(*t);
+        nextTokenView();
+        std::string_view decl = dequoteView(*t);
         size_t sp = decl.find(' ');
-        std::string type = (sp == std::string::npos) ? decl : decl.substr(0, sp);
-        std::string name = (sp == std::string::npos) ? std::string() : decl.substr(sp + 1);
+        std::string_view typeSv = (sp == std::string_view::npos) ? decl : decl.substr(0, sp);
+        std::string_view nameSv = (sp == std::string_view::npos) ? std::string_view() : decl.substr(sp + 1);
         Param p;
-        p.type = type;
-        auto val = nextToken();
-        if (!val) break;
-        if (*val == "[") {
+        p.type = std::string(typeSv);
+        auto valOpt = nextTokenView();
+        if (!valOpt) break;
+        std::string_view val = *valOpt;
+        if (val == "[") {
             while (true) {
-                auto v = nextToken();
-                if (!v || *v == "]") break;
-                if (p.type == "integer")
-                    p.ints.push_back((int)std::strtol(v->c_str(), nullptr, 10));
-                else if (p.type == "string" || p.type == "texture")
-                    p.strings.push_back(dequote(*v));
-                else
-                    p.floats.push_back((float)std::strtod(v->c_str(), nullptr));
+                auto vOpt = nextTokenView();
+                if (!vOpt || *vOpt == "]") break;
+                std::string_view v = *vOpt;
+                if (p.type == "integer") {
+                    int iv = 0;
+                    auto res = std::from_chars(v.data(), v.data() + v.size(), iv);
+                    if (res.ec != std::errc() || res.ptr != v.data() + v.size()) {
+                        // fallback for cases from_chars doesn't handle (e.g. hex)
+                        iv = (int)std::strtol(std::string(v).c_str(), nullptr, 10);
+                    }
+                    p.ints.push_back(iv);
+                } else if (p.type == "string" || p.type == "texture") {
+                    std::string_view dv = dequoteView(v);
+                    p.strings.push_back(std::string(dv));
+                } else {
+                    float fv = 0.f;
+                    auto res = std::from_chars(v.data(), v.data() + v.size(), fv);
+                    if (res.ec != std::errc() || res.ptr != v.data() + v.size()) {
+                        fv = (float)std::strtod(std::string(v).c_str(), nullptr);
+                    }
+                    p.floats.push_back(fv);
+                }
             }
         } else {
-            if (p.type == "integer")
-                p.ints.push_back((int)std::strtol(val->c_str(), nullptr, 10));
-            else if (p.type == "string" || p.type == "texture")
-                p.strings.push_back(dequote(*val));
-            else
-                p.floats.push_back((float)std::strtod(val->c_str(), nullptr));
+            if (p.type == "integer") {
+                int iv = 0;
+                auto res = std::from_chars(val.data(), val.data() + val.size(), iv);
+                if (res.ec != std::errc() || res.ptr != val.data() + val.size()) {
+                    iv = (int)std::strtol(std::string(val).c_str(), nullptr, 10);
+                }
+                p.ints.push_back(iv);
+            } else if (p.type == "string" || p.type == "texture") {
+                std::string_view dv = dequoteView(val);
+                p.strings.push_back(std::string(dv));
+            } else {
+                float fv = 0.f;
+                auto res = std::from_chars(val.data(), val.data() + val.size(), fv);
+                if (res.ec != std::errc() || res.ptr != val.data() + val.size()) {
+                    fv = (float)std::strtod(std::string(val).c_str(), nullptr);
+                }
+                p.floats.push_back(fv);
+            }
         }
-        out[name] = std::move(p);
+        out[std::string(nameSv)] = std::move(p);
     }
     return out;
 }
 
 std::string PbrtParser::readName() {
-    auto t = nextToken();
+    auto t = nextTokenView();
     if (!t) return std::string();
-    return dequote(*t);
+    std::string_view dv = dequoteView(*t);
+    return std::string(dv);
 }
 
 float PbrtParser::readFloat() {
-    auto t = nextToken();
+    auto t = nextTokenView();
     if (!t) return 0.f;
-    return (float)std::strtod(t->c_str(), nullptr);
+    std::string_view v = *t;
+    float fv = 0.f;
+    auto res = std::from_chars(v.data(), v.data() + v.size(), fv);
+    if (res.ec == std::errc() && res.ptr == v.data() + v.size()) return fv;
+    return (float)std::strtod(std::string(v).c_str(), nullptr);
 }
 
 Mat4 PbrtParser::readMat16() {
@@ -401,33 +483,34 @@ Mat4 PbrtParser::readMat16() {
     return m;
 }
 
-void PbrtParser::expectToken(const char* lit) {
-    auto t = nextToken();
+void PbrtParser::expectToken(std::string_view lit) {
+    auto t = nextTokenView();
     if (!t || *t != lit)
-        addWarning(std::string("pbrt: expected '") + lit + "' in matrix statement");
+        addWarning(std::string("pbrt: expected '") + std::string(lit) + "' in matrix statement");
 }
 
 void PbrtParser::pushState() { states_.push_back(states_.back()); }
 void PbrtParser::popState() { if (states_.size() > 1) states_.pop_back(); }
 
 void PbrtParser::parseStream() {
-    while (auto tok = nextToken()) {
+    while (auto tok = nextTokenView()) {
         if (isCancelled()) {
             lastError_ = "cancelled";
             fireAllDone(*result_, false, lastError_);
             return;
         }
-        const std::string& s = *tok;
+        std::string_view s = *tok;
         if (s.empty() || s[0] == '#') continue;
         if (s[0] == '"' || s[0] == '[' || s[0] == ']') {
             if (s[0] == '"') parseParams();
             continue;
         }
-        dispatch(toLower(s), s);
+        std::string low = toLower(s);
+        dispatch(low, s);
     }
 }
 
-void PbrtParser::dispatch(const std::string& low, const std::string& /*raw*/) {
+void PbrtParser::dispatch(std::string_view low, std::string_view /*raw*/) {
     if (low == "worldbegin" || low == "worldend") {
     } else if (low == "attributebegin" || low == "transformbegin") {
         pushState();
@@ -520,8 +603,8 @@ void PbrtParser::dispatch(const std::string& low, const std::string& /*raw*/) {
         std::string fn = readName();
         handleInclude(fn);
     } else {
-        if (peek() && isQuoted(*peek())) {
-            nextToken();
+        if (peekView() && isQuoted(*peekView())) {
+            nextTokenView();
             parseParams();
         }
     }
@@ -621,12 +704,12 @@ void PbrtParser::attachAreaLight_(int taskIdx) {
                       : int32_t(-(2 + taskIdx));
 }
 
-void PbrtParser::handleInclude(const std::string& filename) {
+void PbrtParser::handleInclude(std::string_view filename) {
     std::string dir = files_.empty() ? sourceDir_ : files_.back().dir;
-    std::string full = combinePath(dir, filename);
+    std::string full = combinePath(dir, std::string(filename));
     auto mf = MappedFile::openShared(full);
     if (!mf) {
-        addWarning("pbrt: Include '" + filename + "' not found");
+        addWarning("pbrt: Include '" + std::string(filename) + "' not found");
         return;
     }
     openFiles_.push_back(mf);
@@ -958,6 +1041,8 @@ bool PbrtParser::load(std::string_view path) {
     cancel_.store(false, std::memory_order_relaxed);
     files_.clear();
     ungot_.reset();
+    ungotView_.reset();
+    dequotedViewBuf_.clear();
     openFiles_.clear();
     interned_.clear();
     states_.clear();
