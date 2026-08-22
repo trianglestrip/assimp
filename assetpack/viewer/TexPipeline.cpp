@@ -4,6 +4,7 @@
 #include <taskflow/algorithm/for_each.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <vector>
 
 #ifdef _WIN32
@@ -162,16 +163,31 @@ void TexPipeline::decodeOne(const Ref& t, size_t slot) {
     ++filesMapped;
     int w = 0, h = 0, ch = 0;
     unsigned char* rgba = nullptr;
+    bool usedWic = false;
 #ifdef _WIN32
-    if (!tryDecodeWIC(reinterpret_cast<const uint8_t*>(mf->bytes().data()),
-                      mf->size(), &w, &h, &rgba)) {
-        rgba = nullptr;
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        usedWic = tryDecodeWIC(reinterpret_cast<const uint8_t*>(mf->bytes().data()),
+                               mf->size(), &w, &h, &rgba);
+        auto t1 = std::chrono::steady_clock::now();
+        wicMicros.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+            std::memory_order_relaxed);
+        wicCount.fetch_add(1, std::memory_order_relaxed);
+        if (!usedWic) rgba = nullptr;
     }
 #endif
     if (!rgba) {
+        auto t0 = std::chrono::steady_clock::now();
         rgba = stbi_load_from_memory(
             reinterpret_cast<const unsigned char*>(mf->bytes().data()),
             int(mf->size()), &w, &h, &ch, 4);
+        auto t1 = std::chrono::steady_clock::now();
+        stbMicros.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+            std::memory_order_relaxed);
+        stbCount.fetch_add(1, std::memory_order_relaxed);
+        (void)usedWic;
     }
     if (!rgba) {
         AP_LOG_WARN("tex", "decode failed: %s", t.key.c_str());
@@ -260,6 +276,11 @@ void TexPipeline::finish() {
             futures_.clear();
         }
         for (auto& f : more) f.wait();
+    }
+    if (wicCount.load() || stbCount.load()) {
+        AP_LOG("tex", "decode breakdown: WIC %.1f ms (%zu) | stb %.1f ms (%zu)",
+               wicMicros.load() / 1000.0, size_t(wicCount.load()),
+               stbMicros.load() / 1000.0, size_t(stbCount.load()));
     }
     done_.store(true, std::memory_order_release);
 }

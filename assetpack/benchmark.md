@@ -367,3 +367,22 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
 | 2026-08-23 02:49:30 | [async] textures-queued | 0.0 ms | refs 254 |
 | 2026-08-23 02:49:31 | bistro_cafe.pbrt | 10 | 27.4 | 36.5 | ALL | 1 |
 | 2026-08-23 02:49:42 | [async] all-done | 0.0 ms | + 25896.5 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 03:02:44 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 03:02:44 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 03:02:44 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 03:02:45 | bistro_cafe.pbrt | 30 | 48.0 | 20.8 | ALL | 1 |
+| 2026-08-23 03:02:56 | [async] all-done | 0.0 ms | + 20949.1 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 03:05:07 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 03:05:07 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 03:05:07 | [async] textures-queued | 0.0 ms | refs 254 |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 03:05:10 | bistro_cafe.pbrt | 30 | 16.4 | 61.0 | ALL | 1 |
+| 2026-08-23 03:05:30 | [async] all-done | 0.0 ms | + 111736.6 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 03:08:02 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 03:08:02 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 03:08:02 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 03:08:02 | bistro_cafe.pbrt | 10 | 66.0 | 15.2 | ALL | 1 |
+| 2026-08-23 03:08:09 | [async] all-done | 0.0 ms | + 7349.5 ms | import 0.0 ms, total 0.0 ms |

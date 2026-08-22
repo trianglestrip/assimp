@@ -1115,6 +1115,7 @@ bool PbrtParser::load(std::string_view path) {
             }
             size_t plyVerts = 0, plyFaces = 0;
             bool plyHasUv = false;
+            const auto tHdr0 = std::chrono::steady_clock::now();
             for (const DeferredPly& t : deferredPly_) {
                 size_t v = 0, f = 0;
                 bool u = false;
@@ -1124,6 +1125,10 @@ bool PbrtParser::load(std::string_view path) {
                     if (u) plyHasUv = true;
                 }
             }
+            const auto tHdr1 = std::chrono::steady_clock::now();
+            AP_LOG("pbrt", "header scan: %.0f ms for %zu files",
+                   double(std::chrono::duration_cast<std::chrono::milliseconds>(tHdr1 - tHdr0).count()),
+                   deferredPly_.size());
             const size_t totalVerts = inlineVerts + plyVerts;
             const size_t totalIdx = inlineIdx + plyFaces * 3;
             const bool hasUv = !uvPool_.empty() || plyHasUv;
@@ -1395,7 +1400,6 @@ void PbrtParser::appendPacked(const PackMesh& m, const Mat4& M,
 
 void PbrtParser::loadOnePly(const DeferredPly& t, MergedPly& out) {
     out.mat = t.mat;
-    if (auto pf = MappedFile::openShared(t.full)) pf->prefetch(0, pf->size());
     AssetPack ply;
     if (!ply.load(t.full)) {
         addWarning("pbrt: plymesh failed: " + t.full);
