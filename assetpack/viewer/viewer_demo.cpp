@@ -1034,6 +1034,7 @@ int main(int argc, char** argv) {
                     it.texSlot = texOn && g_meshTex[i] >= 0 ? g_meshTex[i] : -1;
                     for (int k = 0; k < 16; ++k) it.world[k] = m.world[k];
                     it.hasWorld = m.hasWorld;
+                    for (int k = 0; k < 9; ++k) it.normalWorld[k] = m.normalWorld[k];
                     items.push_back(it);
                 }
                 // group same-texture draws: the renderer binds the texture

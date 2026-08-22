@@ -128,6 +128,7 @@ struct PackMesh {
     // lets the GPU do the CTM instead of per-vertex CPU transforms
     float world[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     bool hasWorld = false;
+    float normalWorld[9] = {1,0,0, 0,1,0, 0,0,1};
 
     uint32_t vertexCount()  const;
     uint32_t triangleCount() const;

@@ -28,6 +28,7 @@ public:
         int texSlot = -1;              // TexPipeline slot or -1
         float world[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         bool hasWorld = false;
+        float normalWorld[9] = {1,0,0, 0,1,0, 0,0,1};
     };
 
     virtual ~IRenderer() = default;

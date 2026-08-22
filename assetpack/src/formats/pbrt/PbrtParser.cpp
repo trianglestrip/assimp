@@ -160,6 +160,7 @@ struct MeshMeta {
     float bmax[3] = {0, 0, 0};
     float world[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     bool hasWorld = false;
+    float normalWorld[9] = {1,0,0, 0,1,0, 0,0,1};
 };
 
 struct ParseState {
@@ -732,18 +733,31 @@ void PbrtParser::emitMesh(const std::string& kind, const std::vector<float>& P,
     if (vcount == 0) return;
 
     size_t base = posPool_.size() / 3;
+    float lbmin[3] = {kInf, kInf, kInf};
+    float lbmax[3] = {-kInf, -kInf, -kInf};
+    for (size_t i = 0; i < vcount; ++i) {
+        float x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
+        posPool_.push_back(x);
+        posPool_.push_back(y);
+        posPool_.push_back(z);
+        for (int k = 0; k < 3; ++k) {
+            float v = (k == 0) ? x : (k == 1) ? y : z;
+            if (v < lbmin[k]) lbmin[k] = v;
+            if (v > lbmax[k]) lbmax[k] = v;
+        }
+    }
     float bmin[3] = {kInf, kInf, kInf};
     float bmax[3] = {-kInf, -kInf, -kInf};
-    for (size_t i = 0; i < vcount; ++i) {
-        float ox, oy, oz;
-        matTransformPoint(ctm(), P[i * 3], P[i * 3 + 1], P[i * 3 + 2], ox, oy, oz);
-        posPool_.push_back(ox);
-        posPool_.push_back(oy);
-        posPool_.push_back(oz);
+    for (int c = 0; c < 8; ++c) {
+        float lx = (c & 1) ? lbmax[0] : lbmin[0];
+        float ly = (c & 2) ? lbmax[1] : lbmin[1];
+        float lz = (c & 4) ? lbmax[2] : lbmin[2];
+        float wx, wy, wz;
+        matTransformPoint(ctm(), lx, ly, lz, wx, wy, wz);
+        float vs[3] = {wx, wy, wz};
         for (int k = 0; k < 3; ++k) {
-            float v = (k == 0) ? ox : (k == 1) ? oy : oz;
-            if (v < bmin[k]) bmin[k] = v;
-            if (v > bmax[k]) bmax[k] = v;
+            if (vs[k] < bmin[k]) bmin[k] = vs[k];
+            if (vs[k] > bmax[k]) bmax[k] = vs[k];
         }
     }
 
@@ -757,12 +771,9 @@ void PbrtParser::emitMesh(const std::string& kind, const std::vector<float>& P,
             const size_t avail = N->size() / 3;
             for (size_t i = 0; i < vcount; ++i) {
                 if (i < avail) {
-                    float ox, oy, oz;
-                    matTransformNormal(ctm(), (*N)[i * 3], (*N)[i * 3 + 1], (*N)[i * 3 + 2],
-                                       ox, oy, oz);
-                    nrmPool_.push_back(ox);
-                    nrmPool_.push_back(oy);
-                    nrmPool_.push_back(oz);
+                    nrmPool_.push_back((*N)[i * 3]);
+                    nrmPool_.push_back((*N)[i * 3 + 1]);
+                    nrmPool_.push_back((*N)[i * 3 + 2]);
                 } else {
                     nrmPool_.push_back(0.f); nrmPool_.push_back(0.f); nrmPool_.push_back(0.f);
                 }
@@ -814,6 +825,15 @@ void PbrtParser::emitMesh(const std::string& kind, const std::vector<float>& P,
     m.idxStart = idxBase;
     m.idxCount = idxPool_.size() - idxBase;
     for (int k = 0; k < 3; ++k) { m.bmin[k] = bmin[k]; m.bmax[k] = bmax[k]; }
+    {
+        Mat4 M = ctm();
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) m.world[r * 4 + c] = M[c][r];
+        m.hasWorld = !(M == matIdentity());
+        glm::mat3 nm = glm::inverseTranspose(glm::mat3(M));
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) m.normalWorld[r * 3 + c] = nm[c][r];
+    }
     meshMeta_.push_back(m);
 }
 
@@ -1163,6 +1183,7 @@ bool PbrtParser::load(std::string_view path) {
         for (int k = 0; k < 3; ++k) { pm.boundsMin[k] = m.bmin[k]; pm.boundsMax[k] = m.bmax[k]; }
         for (int i = 0; i < 16; ++i) pm.world[i] = m.world[i];
         pm.hasWorld = m.hasWorld;
+        for (int i = 0; i < 9; ++i) pm.normalWorld[i] = m.normalWorld[i];
         result_->meshes.push_back(std::move(pm));
     }
 
@@ -1241,12 +1262,9 @@ void PbrtParser::appendPacked(const PackMesh& m, const Mat4& M,
         if (out.nrm.size() / 3 < base) out.nrm.resize(base * 3, 0.f);
         if (meshNrm) {
             for (size_t i = 0; i < nv && i * 3 + 2 < m.normals.size(); ++i) {
-                float ox, oy, oz;
-                matTransformNormal(M, m.normals[i * 3], m.normals[i * 3 + 1],
-                                   m.normals[i * 3 + 2], ox, oy, oz);
-                out.nrm.push_back(ox);
-                out.nrm.push_back(oy);
-                out.nrm.push_back(oz);
+                out.nrm.push_back(m.normals[i * 3]);
+                out.nrm.push_back(m.normals[i * 3 + 1]);
+                out.nrm.push_back(m.normals[i * 3 + 2]);
             }
         }
         if (out.nrm.size() / 3 < base + nv)
@@ -1281,6 +1299,11 @@ void PbrtParser::appendPacked(const PackMesh& m, const Mat4& M,
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c) mm.world[r * 4 + c] = M[c][r];
     mm.hasWorld = !(M == matIdentity());
+    {
+        glm::mat3 nm = glm::inverseTranspose(glm::mat3(M));
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) mm.normalWorld[r * 3 + c] = nm[c][r];
+    }
     out.meta.push_back(mm);
 }
 
