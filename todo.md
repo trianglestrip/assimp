@@ -16,11 +16,9 @@
 
 ## 剩余大优化空间（按 ROI）
 
-### P0 — 纹理（`2.6s → 目标 <1.5s`，运行时、无离线约束下）
-- **可见性驱动加载**：当前 `fireTextures` 为 `254 refs` 全量，`viewer` 每帧 `readyCount` 前缀消费；`bistro` 视锥外/远景纹理占多数，改为视锥 + 距离剔除后按需 `enqueue`，首帧可见纹理可从 `123` 降至 `~40`，`首帧带纹理` 可提前 `~1s`
-  - 涉及：`viewer/viewer_demo.cpp:640` 的 `onTexturesReady`/`onTextureReady` + `TexPipeline.h:47` 队列优先级 + `PbrtParser.cpp:715` 的 `ensureTexture` 去重后按需
-- **分辨率/分级**：`WIC` 解码后 `GenerateMips` 已做 `viewer/DxRenderer.cpp:1363`，但源图仍全分辨率解码；对远景/小屏 `uv` 覆盖率低的纹理用 `WIC` 的 `Decode at reduced size`（`IWICBitmapSourceTransform::CopyPixels` 带缩放）或 `stb` 的 `stbi__resample` 降采样，`432M → ~150M` 像素
-- **更快的 PNG 路径**：`WIC` 已好于 `stb`，但 `libspng` + `zlib-ng` 或 `qoi` 中间格式仍可再降 `15-25%`；`EXR` 天空盒 `sky.exr` 仍未解（`stb` 不支持），需 `tinyexr` 补齐
+### P0 — 纹理（`2.6s`，保持一次性解析、并行解码到 GPU）
+- **当前即目标形态**：`PbrtParser.cpp:715` 的 `ensureTexture` 去重后 `fireTextures` 一次性全量（`254 refs`），`viewer/viewer_demo.cpp:640` 的 `onTexturesReady` 批量 `enqueue`，`TexPipeline.h:47` 队列 + `TexPipeline.cpp:149` 的 `WIC 优先/stb 回退` 在 `globalExecutor` 上并行解码，`viewer/DxRenderer.cpp:1363` 生成 `mips` 后分帧 `texBudget` 上传 — 已是一次性解析、并行解码到 `GPU` 的简洁路径，不做可见性/降采样分支
+- **小增益**：更快的 `PNG` 路径 `libspng+zlib-ng` 可再降 `15-25%`；`EXR` 天空盒 `sky.exr` 需 `tinyexr` 补齐（`stb` 不支持）
 
 ### P1 — 几何（`0.4-0.5s → 0.25s`）
 - **顶点量化/压缩**：`posPool` `float32×3` → `int16/uint16` 量化 + `dequant` 在 `VS`（`g_world` 已上 `GPU`），`194MB → ~80MB`，上传与 `concat` 同步受益；`meshopt` 顶点缓存优化 `idxPool` 可提 `GPU` 顶点命中
@@ -33,9 +31,9 @@
 ### P3 — 架构
 - `taskflow` 已统一单池 `src/core/TaskExecutor.h:3`，但 `viewer` 的 `ImGui`/`font` 仍 `std::thread`，可纳入同一 `DAG`：`token→ply→concat→publish→textureEnqueue→WIC` 显式 `succeed/precede`，`corun` 重叠更精细
 
-## 下一步建议（无离线约束）
-1. **可见纹理 + 降采样 WIC**（`P0`，纯运行时，首帧 `1s` 收益）
+## 下一步建议（无离线约束，按用户定案：纹理一次性）
+1. **纹理保持一次性并行解码到 GPU**（`P0` 已是目标形态，后续仅 `WIC→libspng` 小优 + `tinyexr`）
 2. **顶点量化**（`P1`，运行时 `VS` 反量化，`194MB` 减半）
-3. **预算自适应**（`P2`，`2` 行逻辑）
+3. **预算自适应**（`P2`，`texBudget` 按 `frameMs` 反馈，`2` 行逻辑）
 
 > 注：单次测量受本机温控波动 `0.4s↔13s` 影响，已改用交替 `A/B` 均值（`R1/R2 BASE 429/440ms vs PLAN 489/481ms`）为准，`benchmark.md` 保留原始波动记录。
