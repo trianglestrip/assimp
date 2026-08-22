@@ -861,6 +861,73 @@ void PbrtParser::handleShape(const std::string& kind, const ParamMap& params) {
     }
 }
 
+// Cheap PLY header scan: returns the vertex and face element counts plus
+// whether the vertex element carries uv roles. Used to pre-size the GPU
+// geometry stream so pbrt can upload geometry concurrently with the
+// (heavy) parallel .ply load instead of after it. Index count is taken as
+// faceCount*3 (triangle assumption) -- correct for bistro and all triangle
+// ply; non-triangle ply still parses correctly via the blocking path
+// (--nostream), which sizes from the real index buffers.
+static bool plyHeaderCounts(const std::string& path, size_t& verts,
+                            size_t& faces, bool& hasUv) {
+    auto mf = MappedFile::openShared(path);
+    if (!mf) return false;
+    std::string_view text = mf->text();
+    verts = faces = 0;
+    hasUv = false;
+    bool inVertex = false;
+    size_t pos = 0;
+    const size_t n = text.size();
+    while (pos < n) {
+        size_t nl = text.find('\n', pos);
+        size_t le = (nl == std::string_view::npos) ? n : nl;
+        std::string_view line = text.substr(pos, le - pos);
+        if (!line.empty() && line.back() == '\r')
+            line = line.substr(0, line.size() - 1);
+        size_t next = (nl == std::string_view::npos) ? n : nl + 1;
+        size_t i = 0;
+        auto tok = [&](std::string_view& out) {
+            while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+            size_t s = i;
+            while (i < line.size() && line[i] != ' ' && line[i] != '\t') ++i;
+            out = line.substr(s, i - s);
+        };
+        std::string_view t0, t1, t2;
+        tok(t0);
+        tok(t1);
+        tok(t2);
+        if (t0 == "element") {
+            inVertex = false;
+            if (t1 == "vertex") {
+                try {
+                    verts = std::stoul(std::string(t2));
+                } catch (...) {
+                }
+                inVertex = true;
+            } else if (t1 == "face") {
+                try {
+                    faces = std::stoul(std::string(t2));
+                } catch (...) {
+                }
+            }
+        } else if (t0 == "property" && inVertex) {
+            size_t sp = line.find_last_not_of(" \t");
+            size_t lp = (sp == std::string_view::npos)
+                            ? std::string_view::npos
+                            : line.find_last_of(" \t", sp);
+            std::string_view role = (lp != std::string_view::npos)
+                                        ? line.substr(lp + 1)
+                                        : t2;
+            if (role == "u" || role == "v" || role == "s" || role == "t")
+                hasUv = true;
+        } else if (t0 == "end_header") {
+            break;
+        }
+        pos = next;
+    }
+    return true;
+}
+
 bool PbrtParser::load(std::string_view path) {
     result_ = std::make_shared<PackResult>();
     lastError_.clear();
@@ -916,59 +983,150 @@ bool PbrtParser::load(std::string_view path) {
                       .count()),
            meshMeta_.size(), deferredPly_.size());
 
-    // deferred plymesh: parallel load into per-task buffers, then merge
-    // strictly in submission order so output stays deterministic
+    // deferred plymesh: load + concat + (when streaming) GPU-upload in
+    // parallel so the upload overlaps the heavy parallel .ply load rather
+    // than serializing after it. The pools already hold the inline
+    // trianglemesh data from the token pass.
     if (!deferredPly_.empty()) {
         const auto tPly = std::chrono::steady_clock::now();
         unsigned workers = threads_ ? threads_
                                     : std::thread::hardware_concurrency();
         if (!workers) workers = 4;
         std::vector<MergedPly> merged(deferredPly_.size());
-        if (workers > 1 && deferredPly_.size() > 1) {
+        std::vector<int32_t> metaStart(deferredPly_.size(), -1);
+
+        // Streaming pre-pass: size the GPU buffers up front (exact verts/
+        // tris) so onMeta can fire before the load and the upload runs
+        // concurrently with it. Index count assumes triangle ply.
+        const bool streaming = (bool)geoStream().onMeta;
+        if (streaming) {
+            size_t inlineVerts = 0, inlineIdx = 0;
+            for (const MeshMeta& m : meshMeta_) {
+                inlineVerts += m.posCount;
+                inlineIdx += m.idxCount;
+            }
+            size_t plyVerts = 0, plyFaces = 0;
+            bool plyHasUv = false;
+            for (const DeferredPly& t : deferredPly_) {
+                size_t v = 0, f = 0;
+                bool u = false;
+                if (plyHeaderCounts(t.full, v, f, u)) {
+                    plyVerts += v;
+                    plyFaces += f;
+                    if (u) plyHasUv = true;
+                }
+            }
+            const size_t totalVerts = inlineVerts + plyVerts;
+            const size_t totalIdx = inlineIdx + plyFaces * 3;
+            const bool hasUv = !uvPool_.empty() || plyHasUv;
+            geoStream().onMeta(totalVerts, totalIdx / 3, hasUv);
+            posPool_.reserve(totalVerts * 3);
+            nrmPool_.reserve(std::max(nrmPool_.size(), totalVerts * 3));
+            if (hasUv)
+                uvPool_.reserve(totalVerts * 2);
+            idxPool_.reserve(totalIdx);
+            // the inline (already-parsed) ranges sit at the front of the
+            // pools; publish them now so their upload overlaps the load too
+            if (!posPool_.empty())
+                geoStream().onRange(ap::GeoRangeKind::Pos, 0,
+                                    posPool_.data(),
+                                    posPool_.size() * sizeof(float));
+            if (!idxPool_.empty())
+                geoStream().onRange(ap::GeoRangeKind::Idx, 0,
+                                    idxPool_.data(),
+                                    idxPool_.size() * sizeof(uint32_t));
+        }
+
+        if (streaming) {
+            // each task: load (parallel, heavy) then concat + publish its
+            // slice under the pool lock so appends stay ordered and the
+            // published offsets line up with the final pool layout
+            std::mutex poolMx;
             tf::Executor exec(workers > 16 ? 16 : workers);
             tf::Taskflow flow;
             flow.for_each_index(0, int(deferredPly_.size()), 1,
                                 [&](int i) {
                 if (isCancelled()) return;
                 loadOnePly(deferredPly_[size_t(i)], merged[size_t(i)]);
+                std::lock_guard<std::mutex> lk(poolMx);
+                const size_t bPos = posPool_.size() * sizeof(float);
+                const size_t bIdx = idxPool_.size() * sizeof(uint32_t);
+                metaStart[size_t(i)] = int32_t(meshMeta_.size());
+                concatPly(merged[size_t(i)]);
+                const size_t ePos = posPool_.size() * sizeof(float);
+                const size_t eIdx = idxPool_.size() * sizeof(uint32_t);
+                if (ePos > bPos)
+                    geoStream().onRange(
+                        ap::GeoRangeKind::Pos, bPos,
+                        &posPool_[bPos / sizeof(float)], ePos - bPos);
+                if (eIdx > bIdx)
+                    geoStream().onRange(
+                        ap::GeoRangeKind::Idx, bIdx,
+                        &idxPool_[bIdx / sizeof(uint32_t)], eIdx - bIdx);
             });
             exec.run(flow).wait();
+            // uv is small (~50MB) and zero-filled for no-uv meshes; publish
+            // it whole once everything is concatenated
+            if (!uvPool_.empty())
+                geoStream().onRange(ap::GeoRangeKind::Uv, 0,
+                                    uvPool_.data(),
+                                    uvPool_.size() * sizeof(float));
         } else {
-            for (size_t i = 0; i < deferredPly_.size(); ++i) {
-                if (isCancelled()) break;
-                loadOnePly(deferredPly_[i], merged[i]);
+            // ---- existing blocking path (parsers without GeoStreamSink
+            // support, or --nostream): load all, then concat, then let the
+            // viewer do one blocking setGeometry ----
+            if (workers > 1 && deferredPly_.size() > 1) {
+                tf::Executor exec(workers > 16 ? 16 : workers);
+                tf::Taskflow flow;
+                flow.for_each_index(0, int(deferredPly_.size()), 1,
+                                    [&](int i) {
+                    if (isCancelled()) return;
+                    loadOnePly(deferredPly_[size_t(i)], merged[size_t(i)]);
+                });
+                exec.run(flow).wait();
+            } else {
+                for (size_t i = 0; i < deferredPly_.size(); ++i) {
+                    if (isCancelled()) break;
+                    loadOnePly(deferredPly_[i], merged[i]);
+                }
             }
+            const auto tLoaded = std::chrono::steady_clock::now();
+            // pre-reserve the global pools: successive per-task inserts
+            // would otherwise reallocate the whole pool every time
+            // (O(n^2) copying - 6.2 s of concat on bistro before this)
+            size_t totPos = posPool_.size(), totNrm = nrmPool_.size();
+            size_t totUv = uvPool_.size(), totIdx = idxPool_.size();
+            for (const MergedPly& m : merged) {
+                totPos += m.pos.size();
+                totNrm += m.nrm.size();
+                totUv += m.uv.size();
+                totIdx += m.idx.size();
+            }
+            const size_t totVerts = totPos / 3;
+            posPool_.reserve(totPos);
+            nrmPool_.reserve(std::max(totNrm, totVerts * 3));
+            uvPool_.reserve(std::max(totUv, totVerts * 2));
+            idxPool_.reserve(totIdx);
+            for (const MergedPly& m : merged) {
+                metaStart[&m - merged.data()] = int32_t(meshMeta_.size());
+                concatPly(m);
+            }
+            AP_LOG("pbrt", "ply phase: %.0f ms load+transform, %.0f ms concat",
+                   double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                              tLoaded - tPly)
+                              .count()),
+                   double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - tLoaded)
+                              .count()));
         }
-        const auto tLoaded = std::chrono::steady_clock::now();
-        // pre-reserve the global pools: successive per-task inserts would
-        // otherwise reallocate the whole pool every time (O(n^2) copying -
-        // 6.2 s of concat on bistro before this)
-        size_t totPos = posPool_.size(), totNrm = nrmPool_.size();
-        size_t totUv = uvPool_.size(), totIdx = idxPool_.size();
-        for (const MergedPly& m : merged) {
-            totPos += m.pos.size();
-            totNrm += m.nrm.size();
-            totUv += m.uv.size();
-            totIdx += m.idx.size();
-        }
-        const size_t totVerts = totPos / 3;
-        posPool_.reserve(totPos);
-        // attribute pools may gain zero-fill up to full vertex coverage
-        nrmPool_.reserve(std::max(totNrm, totVerts * 3));
-        uvPool_.reserve(std::max(totUv, totVerts * 2));
-        idxPool_.reserve(totIdx);
-        std::vector<int32_t> metaStart(deferredPly_.size(), -1);
-        for (const MergedPly& m : merged) {
-            metaStart[&m - merged.data()] = int32_t(meshMeta_.size());
-            concatPly(m);
-        }
-        AP_LOG("pbrt", "ply phase: %.0f ms load+transform, %.0f ms concat",
+
+        const auto tDone = std::chrono::steady_clock::now();
+        AP_LOG("pbrt", "ply phase: %.0f ms (streaming %d)",
                double(std::chrono::duration_cast<std::chrono::milliseconds>(
-                          tLoaded - tPly)
+                          tDone - tPly)
                           .count()),
-               double(std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - tLoaded)
-                          .count()));
+               int(streaming));
+
         // resolve area lights that were attached to deferred ply tasks
         for (PackLight& L : result_->lights)
             if (L.kind == LightKind::Area && L.meshIndex < -1)
