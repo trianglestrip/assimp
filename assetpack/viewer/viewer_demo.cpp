@@ -407,8 +407,12 @@ static void buildUi(double fpsNow) {
                  ImGuiWindowFlags_NoSavedSettings);
     ImGui::TextUnformatted(g_modelName.c_str());
     if (g_allDone.load()) {
-        ImGui::Text("%llu tris | %.1f fps",
-                    (unsigned long long)g_meshTriStart.back(), fpsNow);
+        // verts may never arrive (failed load): back() on the empty
+        // prefix-sums vector would be UB
+        const uint64_t tris =
+            g_meshTriStart.empty() ? 0 : g_meshTriStart.back();
+        ImGui::Text("%llu tris | %.1f fps", (unsigned long long)tris,
+                    fpsNow);
     } else {
         ImGui::ProgressBar(g_progress.load() / 100.f, ImVec2(-1.f, 0.f), "");
     }
@@ -819,7 +823,8 @@ int main(int argc, char** argv) {
             SDL_Event e;
             const ImGuiIO& io = ImGui::GetIO();
             const auto tEv0 = Clock::now();
-            Clock::time_point tIt0, tDs0;   // set in the scene branch below
+            Clock::time_point tIt0 = tEv0, tDs0 = tEv0;   // set in the scene
+                                                          // branch below
             while (SDL_PollEvent(&e)) {
                 ImGui_ImplSDL2_ProcessEvent(&e);
                 if (e.type == SDL_QUIT) {

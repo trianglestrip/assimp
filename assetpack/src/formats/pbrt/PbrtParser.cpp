@@ -23,6 +23,7 @@
 #include "assetpack/AssetPack.h"
 
 #include <glm/geometric.hpp>             // normalize
+#include <glm/gtc/matrix_inverse.hpp>    // inverseTranspose
 #include <glm/gtc/matrix_transform.hpp>  // translate / scale / rotate
 #include <glm/matrix.hpp>                // inverse / inverseTranspose
 #include <glm/mat4x4.hpp>
@@ -97,10 +98,6 @@ void matTransformNormal(const Mat4& m, float x, float y, float z,
     oz = n.z;
 }
 
-// normal matrix: inverse-transpose of the upper-left 3x3. The previous
-// hand-written path dotted columns of the inverse -- the same M^-T -- so
-// glm::inverseTranspose is behavior-preserving (and correct under
-// non-uniform scale); it replaces both matInvert and the old body.
 char decodeEscape(char c) {
     switch (c) {
         case 'n': return '\n';
@@ -245,6 +242,12 @@ private:
     std::vector<uint32_t> idxPool_;
     std::vector<MeshMeta> meshMeta_;
     size_t meshCounter_ = 0;
+    // verts already covered by nrm/uv pools; once a pool starts it must
+    // stay aligned to the global vertex count (zeros where a shape lacks
+    // the attribute) because consumers upload whole pools sized by the
+    // position count
+    size_t nrmEmittedVerts_ = 0;
+    size_t uvEmittedVerts_ = 0;
 
     std::string sourceDir_;
 };
@@ -574,34 +577,50 @@ void PbrtParser::emitMesh(const std::string& kind, const std::vector<float>& P,
     }
 
     size_t nbase = nrmPool_.size() / 3, ncount = 0;
-    if (wantNormals_ && N && !N->empty()) {
-        size_t avail = N->size() / 3;
-        for (size_t i = 0; i < vcount; ++i) {
-            if (i < avail) {
-                float ox, oy, oz;
-                matTransformNormal(ctm(), (*N)[i * 3], (*N)[i * 3 + 1], (*N)[i * 3 + 2],
-                                   ox, oy, oz);
-                nrmPool_.push_back(ox);
-                nrmPool_.push_back(oy);
-                nrmPool_.push_back(oz);
-            } else {
-                nrmPool_.push_back(0.f); nrmPool_.push_back(0.f); nrmPool_.push_back(0.f);
+    const bool shapeNrm = wantNormals_ && N && !N->empty();
+    if (shapeNrm || !nrmPool_.empty()) {
+        // backfill zeros for shapes emitted before the pool started,
+        // pad zeros for this shape when it lacks normals
+        if (nrmEmittedVerts_ < base) nrmPool_.resize(base * 3, 0.f);
+        if (shapeNrm) {
+            const size_t avail = N->size() / 3;
+            for (size_t i = 0; i < vcount; ++i) {
+                if (i < avail) {
+                    float ox, oy, oz;
+                    matTransformNormal(ctm(), (*N)[i * 3], (*N)[i * 3 + 1], (*N)[i * 3 + 2],
+                                       ox, oy, oz);
+                    nrmPool_.push_back(ox);
+                    nrmPool_.push_back(oy);
+                    nrmPool_.push_back(oz);
+                } else {
+                    nrmPool_.push_back(0.f); nrmPool_.push_back(0.f); nrmPool_.push_back(0.f);
+                }
             }
+        } else {
+            nrmPool_.resize((base + vcount) * 3, 0.f);
         }
+        nrmEmittedVerts_ = base + vcount;
         ncount = vcount;
     }
 
     size_t ubase = uvPool_.size() / 2, ucount = 0;
-    if (wantTexcoords_ && uv && !uv->empty()) {
-        size_t avail = uv->size() / 2;
-        for (size_t i = 0; i < vcount; ++i) {
-            if (i < avail) {
-                uvPool_.push_back((*uv)[i * 2]);
-                uvPool_.push_back((*uv)[i * 2 + 1]);
-            } else {
-                uvPool_.push_back(0.f); uvPool_.push_back(0.f);
+    const bool shapeUv = wantTexcoords_ && uv && !uv->empty();
+    if (shapeUv || !uvPool_.empty()) {
+        if (uvEmittedVerts_ < base) uvPool_.resize(base * 2, 0.f);
+        if (shapeUv) {
+            const size_t avail = uv->size() / 2;
+            for (size_t i = 0; i < vcount; ++i) {
+                if (i < avail) {
+                    uvPool_.push_back((*uv)[i * 2]);
+                    uvPool_.push_back((*uv)[i * 2 + 1]);
+                } else {
+                    uvPool_.push_back(0.f); uvPool_.push_back(0.f);
+                }
             }
+        } else {
+            uvPool_.resize((base + vcount) * 2, 0.f);
         }
+        uvEmittedVerts_ = base + vcount;
         ucount = vcount;
     }
 
@@ -790,6 +809,8 @@ bool PbrtParser::load(std::string_view path) {
     idxPool_.clear();
     meshMeta_.clear();
     meshCounter_ = 0;
+    nrmEmittedVerts_ = 0;
+    uvEmittedVerts_ = 0;
 
     auto mainFile = MappedFile::openShared(path);
     if (!mainFile) {
@@ -895,23 +916,36 @@ bool PbrtParser::mergePlyViaAssetPack(const std::string& full) {
         }
 
         size_t nbase = nrmPool_.size() / 3, ncount = 0;
-        if (wantNormals_ && !m.normals.empty()) {
-            for (size_t i = 0; i < nv && i * 3 + 2 < m.normals.size(); ++i) {
-                float ox, oy, oz;
-                matTransformNormal(M, m.normals[i * 3], m.normals[i * 3 + 1],
-                                   m.normals[i * 3 + 2], ox, oy, oz);
-                nrmPool_.push_back(ox);
-                nrmPool_.push_back(oy);
-                nrmPool_.push_back(oz);
+        const bool meshNrm = wantNormals_ && !m.normals.empty();
+        if (meshNrm || !nrmPool_.empty()) {
+            if (nrmEmittedVerts_ < base) nrmPool_.resize(base * 3, 0.f);
+            if (meshNrm) {
+                for (size_t i = 0; i < nv && i * 3 + 2 < m.normals.size(); ++i) {
+                    float ox, oy, oz;
+                    matTransformNormal(M, m.normals[i * 3], m.normals[i * 3 + 1],
+                                       m.normals[i * 3 + 2], ox, oy, oz);
+                    nrmPool_.push_back(ox);
+                    nrmPool_.push_back(oy);
+                    nrmPool_.push_back(oz);
+                }
             }
-            ncount = nrmPool_.size() / 3 - nbase;
+            // pad to nv either way (shape lacks normals or had fewer rows)
+            if (nrmPool_.size() / 3 < base + nv)
+                nrmPool_.resize((base + nv) * 3, 0.f);
+            nrmEmittedVerts_ = base + nv;
+            ncount = nv;
         }
 
         size_t ubase = uvPool_.size() / 2, ucount = 0;
-        if (wantTexcoords_ && !m.texcoords.empty()) {
+        const bool meshUv = wantTexcoords_ && !m.texcoords.empty();
+        if (meshUv || !uvPool_.empty()) {
+            if (uvEmittedVerts_ < base) uvPool_.resize(base * 2, 0.f);
             uvPool_.insert(uvPool_.end(), m.texcoords.begin(),
                            m.texcoords.end());
-            ucount = uvPool_.size() / 2 - ubase;
+            if (uvPool_.size() / 2 < base + nv)
+                uvPool_.resize((base + nv) * 2, 0.f);
+            uvEmittedVerts_ = base + nv;
+            ucount = nv;
         }
 
         size_t idxBase = idxPool_.size();
