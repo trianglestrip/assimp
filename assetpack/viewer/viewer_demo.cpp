@@ -641,7 +641,7 @@ static void bindEvents(ap::AssetPack& pack) {
         [](ap::PackResult& r, std::span<const ap::PackTexture> texs) {
             // background mmap + stb_image decode of every external
             // reference; slots publish progressively via readyCount()
-            g_texPipe.decodeAll(texs);
+            g_texPipe.enqueue(texs);
             AP_LOG("viewer", "textures queued: %zu refs (background decode)",
                    texs.size());
             benchAppend("| " + timestamp() + " | [async] textures-queued | "
@@ -654,6 +654,9 @@ static void bindEvents(ap::AssetPack& pack) {
         g_totalMs = double(r.totalMicros) / 1000.0;
         const double deltaMs = secsSince(g_tLoad) * 1000.0;
         g_allDone.store(true);
+        // no further texture references will arrive; let the decode
+        // worker drain and exit
+        g_texPipe.finish();
         if (!ok)
             AP_LOG_WARN("viewer", "parse failed: %.*s", int(err.size()),
                         err.data());

@@ -130,3 +130,76 @@ triangles.
 | time | model | frames | avg fps | ms/frame | budget | stride |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | 2026-08-22 22:31:43 | bistro_cafe.pbrt | 200 | 40.2 | 24.9 | ALL | 1 |
+| 2026-08-22 22:51:04 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-22 22:51:04 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-22 22:51:04 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-22 22:51:04 | [async] all-done | 0.0 ms | + 1497.4 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-22 22:51:08 | bistro_cafe.pbrt | 200 | 46.0 | 21.8 | ALL | 1 |
+| 2026-08-23 00:16:22 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 00:16:22 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 00:16:22 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 00:16:22 | [async] all-done | 0.0 ms | + 1445.5 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 00:16:56 | bistro_cafe.pbrt | 200 | 5.9 | 169.7 | ALL | 1 |
+| 2026-08-23 00:17:58 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 00:17:58 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 00:17:58 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 00:17:58 | [async] all-done | 0.0 ms | + 1629.0 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 00:18:06 | bistro_cafe.pbrt | 60 | 7.1 | 140.4 | ALL | 1 |
+| 2026-08-23 00:25:30 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 00:25:30 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 00:25:30 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 00:25:30 | [async] all-done | 0.0 ms | + 580.1 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 00:25:32 | bistro_cafe.pbrt | 30 | 12.2 | 82.1 | ALL | 1 |
+| 2026-08-23 00:25:35 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 00:25:35 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 00:25:35 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 00:25:35 | [async] all-done | 0.0 ms | + 623.7 ms | import 0.0 ms, total 0.0 ms |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 00:25:38 | bistro_cafe.pbrt | 30 | 13.2 | 76.0 | ALL | 1 |
+| 2026-08-23 00:25:40 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 00:25:40 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 00:25:40 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 00:25:40 | [async] all-done | 0.0 ms | + 576.1 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 00:25:42 | bistro_cafe.pbrt | 30 | 12.9 | 77.8 | ALL | 1 |
+| 2026-08-23 00:25:44 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 00:25:44 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 00:25:44 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 00:25:44 | [async] all-done | 0.0 ms | + 621.8 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 00:25:46 | bistro_cafe.pbrt | 30 | 12.2 | 82.3 | ALL | 1 |
+
+## texture pipeline: where should reading live? -- 2026-08-23 00:26:32
+Design question: should the parser read texture bytes into memory and fire
+an event, or only resolve paths and let the display read+decode?
+
+Decision: parser resolves PATHS ONLY (PackTexture.resolvedPath / zero-copy
+data span for embedded); the display (TexPipeline) does mmap + stb decode +
+GPU upload. Reasons: codec knowledge stays out of the scene parser; decoded
+pixels (~480 MB on bistro) never double-buffered; the 1.7 s decode is CPU
+work that must happen wherever pixels become GPU-ready regardless.
+
+Implemented alongside: TexPipeline refactored from single-shot decodeAll()
+to a queue model -- enqueue() may be called repeatedly as references are
+discovered, a persistent worker pool drains diffuse slots (decoded) and
+stat-mmaps others, finish() lets it exit. readyCount() prefix semantics
+unchanged; slot growth and publish are serialized under qMx_ so queue
+growth cannot race decoders.
+
+Incremental firing experiment (pbrt fired each ref mid token-pass so decode
+overlapped the parse tail): REJECTED for this workload. Decode and parse are
+both CPU-bound; overlapping them starves both stages. CAUTION: single runs
+on this box swing >3x (thermal) -- a first measurement suggested ply phase
+457->1213 ms regression, but interleaved A/B showed the COMMITTED BASELINE
+itself hits 1319 ms on some runs. Fair back-to-back comparison:
+
+| metric              | base avg | queue+batch avg |
+| ---                 | ---:     | ---:            |
+| ply phase           | 434 ms   | 485 ms          |
+| 123/123 textures    | ~2.68 s  | ~2.68 s         |
+
+=> parity within noise. Shipped configuration: batch fireTextures at parse
+end (uncontended decode), queue-based TexPipeline retained as the engine so
+incremental enqueue remains available if a throttled overlap is ever wanted.
+All 91 unit tests pass; bistro renders correctly (123/123 textures).

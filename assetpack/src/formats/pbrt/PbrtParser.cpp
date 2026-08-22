@@ -1165,6 +1165,11 @@ bool PbrtParser::load(std::string_view path) {
     fireProgress(100.f);
     fireVertices(*result_, result_->meshes);
     fireMaterials(*result_, result_->materials);
+    // textures: the consumer (viewer) reads + decodes these references on
+    // its own background pool; firing them as one batch at parse end lets
+    // the decode run uncontented (overlapping decode with the parse tail
+    // regresses wall time here because both stages are CPU-bound and share
+    // cores -- see benchmark.md).
     fireTextures(*result_, result_->textures);
     fireAllDone(*result_, true, {});
     return true;

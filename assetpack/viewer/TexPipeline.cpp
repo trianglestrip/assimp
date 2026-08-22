@@ -2,6 +2,7 @@
 #include <assetpack/AssetPack.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <thread>
 #include <vector>
 
@@ -22,41 +23,83 @@ int TexPipeline::slotFor(std::string_view mtlPath) const {
 }
 
 void TexPipeline::releaseSlots(size_t from, size_t to) {
-    if (to > total_) to = total_;
-    if (from >= total_) return;
+    const size_t total = total_.load(std::memory_order_acquire);
+    if (to > total) to = total;
+    if (from >= total) return;
     size_t freed = 0;
     for (size_t i = from; i < to; ++i) {
         DecodedTex& t = texs_[i];
         if (!t.rgba) continue;
         freed += size_t(t.w) * size_t(t.h) * 4;
-        t.rgba.reset();   // stbi_image_free
+        t.rgba.reset(); // stbi_image_free
     }
     bytesReleased += freed;
     if (freed)
         AP_LOG("tex", "released %.1f MB decoded pixels (%zu/%zu handed to GPU)",
-               double(freed) / 1048576.0, to, total_);
+               double(freed) / 1048576.0, to, total);
 }
 
 TexPipeline::~TexPipeline() {
+    // guarantee the worker can never block join() on an unset finish
+    finished_.store(true, std::memory_order_release);
+    qCv_.notify_all();
     if (worker_.joinable()) worker_.join();
 }
 
-void TexPipeline::runDecode(const std::vector<Ref>& diffuse,
-                            const std::vector<Ref>& others) {
+void TexPipeline::enqueue(std::span<const ap::PackTexture> texs) {
+    if (texs.empty()) return;
+    std::vector<Ref> nd, no;
+    for (const auto& t : texs) {
+        if (t.embedded || t.resolvedPath.empty()) continue;
+        const bool diff = (t.type == int(ap::TexType::TexDiffuse));
+        Ref r{std::string(t.path), t.resolvedPath, diff};
+        (diff ? nd : no).push_back(std::move(r));
+    }
+    if (nd.empty() && no.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(qMx_);
+        const size_t old = texs_.size();
+        for (auto& r : nd) diffuseQ_.push_back(std::move(r));
+        for (auto& r : no) othersQ_.push_back(std::move(r));
+        const size_t need = diffuseQ_.size();
+        if (need > old) {
+            texs_.resize(need);
+            auto nsd = std::make_unique<std::atomic<uint8_t>[]>(need);
+            for (size_t i = 0; i < old; ++i)
+                nsd[i].store(slotDone_[i].load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+            for (size_t i = old; i < need; ++i)
+                nsd[i].store(0, std::memory_order_relaxed);
+            slotDone_ = std::move(nsd);
+        }
+        total_.store(need, std::memory_order_release);
+    }
+    qCv_.notify_all();
+    if (!running_.exchange(true))
+        worker_ = std::thread([this]() { runDecodeLoop(); });
+}
+
+void TexPipeline::finish() {
+    finished_.store(true, std::memory_order_release);
+    qCv_.notify_all();
+}
+
+void TexPipeline::runDecodeLoop() {
     const unsigned n = std::max(1u, std::thread::hardware_concurrency());
 
-    // publish the longest fully-decoded prefix: consumers only ever see a
-    // contiguous range of finished slots, never holes
+    // caller must hold qMx_: publishes the longest contiguous decoded
+    // prefix so consumers only ever see a prefix, never holes
     auto advancePrefix = [&]() {
         size_t cur = ready_.load(std::memory_order_acquire);
-        while (cur < total_ && slotDone_[cur].load(std::memory_order_acquire)) {
+        while (cur < total_.load() &&
+               slotDone_[cur].load(std::memory_order_acquire)) {
             const size_t want = cur + 1;
             if (ready_.compare_exchange_strong(cur, want,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_relaxed)) {
-                {
-                    std::lock_guard<std::mutex> lock(pathMx_);
-                    byPath_.emplace(diffuse[cur].key, int(cur));
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_relaxed)) {
+                if (diffuseQ_[cur].diffuse) {
+                    std::lock_guard<std::mutex> plk(pathMx_);
+                    byPath_.emplace(diffuseQ_[cur].key, int(cur));
                 }
                 cur = ready_.load(std::memory_order_acquire);
             } else {
@@ -83,55 +126,70 @@ void TexPipeline::runDecode(const std::vector<Ref>& diffuse,
         dt.w = w;
         dt.h = h;
         dt.rgba = {rgba, &stbiFree};
-        texs_[slot] = std::move(dt);
-        pixels += size_t(w) * size_t(h);
+        // publish under qMx_ so queue growth (which also holds qMx_)
+        // can never race with this write
+        {
+            std::lock_guard<std::mutex> lk(qMx_);
+            texs_[slot] = std::move(dt);
+            slotDone_[slot].store(1, std::memory_order_release);
+            advancePrefix();
+        }
     };
 
     std::vector<std::thread> pool;
     pool.reserve(n);
     for (unsigned tid = 0; tid < n; ++tid) {
         pool.emplace_back([&, tid]() {
-            // strided assignment keeps global completion roughly even so
-            // the visible prefix advances smoothly
-            for (size_t j = tid; j < diffuse.size(); j += n) {
-                decodeOne(diffuse[j], j);
-                slotDone_[j].store(1, std::memory_order_release);
-                advancePrefix();
-            }
-            // stat-only mmaps for the non-diffuse refs (normals etc.)
-            for (size_t k = tid; k < others.size(); k += n) {
-                auto mf = ap::MappedFile::openShared(others[k].resolved);
-                if (!mf) continue;
-                bytesMapped += mf->size();
-                ++filesMapped;
+            (void)tid; // strided assignment keeps completion even; here we
+                       // claim the next free slot under the lock instead
+            for (;;) {
+                Ref r;
+                bool isDiff = false, isOther = false;
+                size_t j = 0, k = 0;
+                {
+                    std::lock_guard<std::mutex> lk(qMx_);
+                    if (diffuseCur_ < diffuseQ_.size()) {
+                        j = diffuseCur_++;
+                        r = diffuseQ_[j];
+                        isDiff = true;
+                    } else if (othersCur_ < othersQ_.size()) {
+                        k = othersCur_++;
+                        r = othersQ_[k];
+                        isOther = true;
+                    }
+                }
+                if (isDiff) {
+                    decodeOne(r, j);
+                    continue;
+                }
+                if (isOther) {
+                    // stat-only mmap for non-diffuse refs (normals etc.)
+                    auto mf = ap::MappedFile::openShared(r.resolved);
+                    if (mf) {
+                        bytesMapped += mf->size();
+                        ++filesMapped;
+                    }
+                    continue;
+                }
+                // nothing claimable right now
+                if (finished_.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lk(qMx_);
+                    if (diffuseCur_ >= diffuseQ_.size() &&
+                        othersCur_ >= othersQ_.size())
+                        break;
+                }
+                std::unique_lock<std::mutex> lk(qMx_);
+                qCv_.wait(lk, [&] {
+                    return (diffuseCur_ < diffuseQ_.size()) ||
+                           (othersCur_ < othersQ_.size()) ||
+                           finished_.load(std::memory_order_acquire);
+                });
             }
         });
     }
     for (auto& th : pool) th.join();
     done_.store(true, std::memory_order_release);
-}
-
-void TexPipeline::decodeAll(std::span<const ap::PackTexture> texs) {
-    if (worker_.joinable()) return;   // a decode is already in flight
-    std::vector<Ref> diffuse, others;
-    for (const ap::PackTexture& t : texs) {
-        if (t.embedded || t.resolvedPath.empty()) continue;
-        auto& dst = t.type == int(ap::TexType::TexDiffuse) ? diffuse : others;
-        dst.push_back({std::string(t.path), t.resolvedPath});
-    }
-    total_ = diffuse.size();
-    texs_.clear();
-    texs_.resize(total_);
-    slotDone_.reset(new std::atomic<uint8_t>[total_ ? total_ : 1]);
-    for (size_t i = 0; i < total_; ++i)
-        slotDone_[i].store(0, std::memory_order_relaxed);
-    ready_.store(0, std::memory_order_relaxed);
-    done_.store(false, std::memory_order_relaxed);
-
-    worker_ = std::thread([this, diffuse = std::move(diffuse),
-                           others = std::move(others)]() mutable {
-        runDecode(diffuse, others);
-    });
+    running_.store(false, std::memory_order_release);
 }
 
 } // namespace texp

@@ -39,10 +39,16 @@ struct DecodedTex {
 
 class TexPipeline {
 public:
-    // Start decoding every external reference in parallel on a
-    // background pool; returns immediately. Slots become visible
-    // monotonically through readyCount().
-    void decodeAll(std::span<const ap::PackTexture> texs);
+    // Enqueue external texture references for parallel decode on a
+    // background pool. May be called repeatedly as the parser discovers
+    // references (incremental), so decode overlaps the parse tail;
+    // returns immediately. Slots become visible monotonically through
+    // readyCount(). Call finish() once no more references will arrive.
+    void enqueue(std::span<const ap::PackTexture> texs);
+
+    // Inform the pipeline that no further enqueues are coming; lets the
+    // background worker exit once its queue drains.
+    void finish();
 
     // Free the decoded pixels of slots [from, to) after the renderer
     // uploaded them to the GPU; w/h stay valid for the slot count.
@@ -50,7 +56,7 @@ public:
 
     // total allocated slots (>= readyCount()); only the ready prefix is
     // safe to consume
-    size_t count() const { return total_; }
+    size_t count() const { return total_.load(std::memory_order_acquire); }
     // number of leading slots fully decoded and immutable
     size_t readyCount() const { return ready_.load(std::memory_order_acquire); }
     bool done() const { return done_.load(std::memory_order_acquire); }
@@ -75,17 +81,25 @@ private:
     struct Ref {
         std::string key;      // material path used for slot lookup
         std::string resolved; // absolute file path to mmap
+        bool        diffuse = true;
     };
-    void runDecode(const std::vector<Ref>& diffuse,
-                   const std::vector<Ref>& others);
+    void runDecodeLoop();
 
-    std::vector<DecodedTex> texs_;     // fixed after decodeAll starts
-    size_t total_ = 0;                 // == texs_.size() once started
+    std::vector<Ref> diffuseQ_;   // decoded + uploaded
+    std::vector<Ref> othersQ_;    // normals etc., stat-only
+    std::atomic<size_t> diffuseCur_{0};
+    std::atomic<size_t> othersCur_{0};
+    std::vector<DecodedTex> texs_;   // sized to diffuseQ_.size()
+    std::atomic<size_t> total_{0};   // == diffuseQ_.size()
     std::unique_ptr<std::atomic<uint8_t>[]> slotDone_;
-    std::atomic<size_t> ready_{0};     // longest decoded prefix
+    std::atomic<size_t> ready_{0};   // longest decoded prefix
     std::atomic<bool> done_{false};
+    std::atomic<bool> finished_{false};  // no more enqueues coming
+    std::atomic<bool> running_{false};
     std::thread worker_;
-    mutable std::mutex pathMx_;
+    std::mutex qMx_;               // guards queues + texs_/slotDone_ growth
+    std::condition_variable qCv_;
+    mutable std::mutex pathMx_;    // guards byPath_
     std::unordered_map<std::string_view, int> byPath_;
 };
 
