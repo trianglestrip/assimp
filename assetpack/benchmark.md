@@ -322,3 +322,24 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
 
 验证：91/91 通过；bistro 端到端受温控波动大，交替 A/B 仍显示纹理解码
 与几何共享池后无额外争抢，ply 阶段保持 0.4-0.5s 基线。
+| 2026-08-23 01:52:36 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:52:36 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:52:36 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:52:36 | bistro_cafe.pbrt | 30 | 62.8 | 15.9 | ALL | 1 |
+| 2026-08-23 01:52:41 | [async] all-done | 0.0 ms | + 1830.3 ms | import 0.0 ms, total 0.0 ms |
+
+## GPU CTM 完全体（位置+法线零 CPU 变换） -- 2026-08-23 01:57:05
+- PbrtParser: emitMesh/appendPacked 去掉逐顶点 matTransformPoint/Normal
+  (8.4M 顶点)，位置/法线存局部，MeshMeta/PackMesh 世界矩阵 world[16] +
+  法线矩阵 normalWorld[9]=inverseTranspose(mat3(M)) 行主序，随 draw 传递
+- 世界包围由 8 局部角点经 CTM 求得（6800 次变换替代 8.4M）
+- DxRenderer: 根签名 b0 Cam 16 + b1 Mat 5 + b2 World 16 + t0，VS 首行
+  pW = mul(float4(v.pos,1), g_world).xyz；法线矩阵已存备用（当前管线
+  未上传 nrmPool，故 shader 暂未使用 normalWorld）
+- 验证：91/91 通过；bistro 端到端受温控波动，ply 阶段保持 0.4-0.9s 基线
+  附近，CPU 零变换完成
+
+下一步（运行时，无离线）：
+- 纹理预算自适应：drawScene texBudget 32 改为 frameMs 反馈（gpuTiming <16.6ms 增大，>16.6ms 减小）
+- 绘制：1591 draws 已按 texSlot 排序，材质合并因 index/world/bounds 唯一不做
+- 几何：ply 已并行+流式+GPU CTM，剩余可做顶点量化/压缩（meshopt）运行时
