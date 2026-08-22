@@ -32,6 +32,7 @@ target_include_directories(assetpack
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src           # core/ detail/ formats/ 内部头
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party   # <taskflow/taskflow.hpp>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rapidjson/include  # glTF JSON
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/glm/include        # parser matrix math
 )
 target_compile_features(assetpack PUBLIC cxx_std_20)
 

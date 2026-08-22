@@ -16,10 +16,19 @@
 //   - Texture ... imagemap string filename + texture Kd name refs
 //   - LightSource / AreaLightSource (accepted, geometry priority)
 //
-// Transform matrix math uses a tiny self-contained mat4 (column-major).
+// Transform matrix math uses GLM (vendored under third_party/glm,
+// private include only -- the public header stays dependency-free).
 // ============================================================
 
 #include "assetpack/AssetPack.h"
+
+#include <glm/geometric.hpp>             // normalize
+#include <glm/gtc/matrix_transform.hpp>  // translate / scale / rotate
+#include <glm/matrix.hpp>                // inverse / inverseTranspose
+#include <glm/mat4x4.hpp>
+#include <glm/trigonometric.hpp>         // radians
+#include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
 
 #include <algorithm>
 #include <array>
@@ -43,118 +52,55 @@ namespace ap {
 
 namespace {
 
-using Mat4 = std::array<float, 16>;
+using Mat4 = glm::mat4;
 
-constexpr float kPi = 3.14159265358979323846f;
 constexpr float kInf = 1e30f;
 
 float clamp01(float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 
-Mat4 matIdentity() {
-    Mat4 m{};
-    m[0] = m[5] = m[10] = m[15] = 1.f;
-    return m;
-}
-
-Mat4 matMul(const Mat4& a, const Mat4& b) {
-    Mat4 r{};
-    for (int c = 0; c < 4; ++c)
-        for (int row = 0; row < 4; ++row) {
-            float s = 0.f;
-            for (int k = 0; k < 4; ++k)
-                s += a[k * 4 + row] * b[c * 4 + k];
-            r[c * 4 + row] = s;
-        }
-    return r;
-}
+Mat4 matIdentity() { return glm::mat4(1.f); }
+Mat4 matMul(const Mat4& a, const Mat4& b) { return a * b; }
 
 Mat4 matTranslate(float x, float y, float z) {
-    Mat4 m = matIdentity();
-    m[12] = x;
-    m[13] = y;
-    m[14] = z;
-    return m;
+    return glm::translate(glm::mat4(1.f), glm::vec3(x, y, z));
 }
 
 Mat4 matScale(float x, float y, float z) {
-    Mat4 m{};
-    m[0] = x;
-    m[5] = y;
-    m[10] = z;
-    m[15] = 1.f;
-    return m;
+    return glm::scale(glm::mat4(1.f), glm::vec3(x, y, z));
 }
 
+// degree -> radians conversion happens here (glm takes radians)
 Mat4 matRotate(float angDeg, float ax, float ay, float az) {
-    float len = std::sqrt(ax * ax + ay * ay + az * az);
-    if (len == 0.f) return matIdentity();
-    ax /= len; ay /= len; az /= len;
-    float a = angDeg * kPi / 180.f;
-    float c = std::cos(a), s = std::sin(a), t = 1.f - c;
-    float R[4][4] = {};
-    R[0][0] = t * ax * ax + c;
-    R[0][1] = t * ax * ay - s * az;
-    R[0][2] = t * ax * az + s * ay;
-    R[1][0] = t * ax * ay + s * az;
-    R[1][1] = t * ay * ay + c;
-    R[1][2] = t * ay * az - s * ax;
-    R[2][0] = t * ax * az - s * ay;
-    R[2][1] = t * ay * az + s * ax;
-    R[2][2] = t * az * az + c;
-    R[3][3] = 1.f;
-    Mat4 m{};
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j)
-            m[j * 4 + i] = R[i][j];
-    return m;
+    return glm::rotate(glm::mat4(1.f), glm::radians(angDeg),
+                       glm::vec3(ax, ay, az));
 }
 
 void matTransformPoint(const Mat4& m, float x, float y, float z,
                        float& ox, float& oy, float& oz) {
-    float w = m[3] * x + m[7] * y + m[11] * z + m[15];
-    ox = m[0] * x + m[4] * y + m[8] * z + m[12];
-    oy = m[1] * x + m[5] * y + m[9] * z + m[13];
-    oz = m[2] * x + m[6] * y + m[10] * z + m[14];
-    if (w != 0.f) { ox /= w; oy /= w; oz /= w; }
+    const glm::vec4 p = m * glm::vec4(x, y, z, 1.f);
+    ox = p.x;
+    oy = p.y;
+    oz = p.z;
+    if (p.w != 0.f) { ox /= p.w; oy /= p.w; oz /= p.w; }
 }
 
-bool matInvert(const Mat4& m, Mat4& out) {
-    const float* a = m.data();
-    float inv[16];
-    inv[0] = a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
-    inv[4] = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
-    inv[8] = a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
-    inv[12] = -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
-    inv[1] = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
-    inv[5] = a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
-    inv[9] = -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
-    inv[13] = a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
-    inv[2] = a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
-    inv[6] = -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
-    inv[10] = a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
-    inv[14] = -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
-    inv[3] = -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
-    inv[7] = a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
-    inv[11] = -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11] - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
-    inv[15] = a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10] + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
-    float det = a[0]*inv[0] + a[1]*inv[4] + a[2]*inv[8] + a[3]*inv[12];
-    if (det == 0.f) return false;
-    float idet = 1.f / det;
-    for (int i = 0; i < 16; ++i) out[i] = inv[i] * idet;
-    return true;
-}
-
+// normal matrix: inverse-transpose of the upper-left 3x3. The previous
+// hand-written path dotted columns of the inverse -- the same M^-T --
+// so this is behavior-preserving (and correct under non-uniform scale).
 void matTransformNormal(const Mat4& m, float x, float y, float z,
                         float& ox, float& oy, float& oz) {
-    Mat4 inv;
-    if (!matInvert(m, inv)) { ox = x; oy = y; oz = z; return; }
-    ox = inv[0]*x + inv[1]*y + inv[2]*z;
-    oy = inv[4]*x + inv[5]*y + inv[6]*z;
-    oz = inv[8]*x + inv[9]*y + inv[10]*z;
-    float len = std::sqrt(ox*ox + oy*oy + oz*oz);
-    if (len > 0.f) { ox /= len; oy /= len; oz /= len; }
+    const glm::vec3 n =
+        glm::normalize(glm::mat3(glm::inverseTranspose(m)) *
+                       glm::vec3(x, y, z));
+    ox = n.x;
+    oy = n.y;
+    oz = n.z;
 }
 
+// normal matrix: inverse-transpose of the upper-left 3x3. The previous
+// hand-written path dotted columns of the inverse -- the same M^-T -- so
+// glm::inverseTranspose is behavior-preserving (and correct under
+// non-uniform scale); it replaces both matInvert and the old body.
 char decodeEscape(char c) {
     switch (c) {
         case 'n': return '\n';
@@ -407,7 +353,8 @@ float PbrtParser::readFloat() {
 
 Mat4 PbrtParser::readMat16() {
     Mat4 m{};
-    for (int i = 0; i < 16; ++i) m[i] = readFloat();
+    // the file stores column-major floats: flat idx i maps to [i/4][i%4]
+    for (int i = 0; i < 16; ++i) m[i / 4][i % 4] = readFloat();
     return m;
 }
 
