@@ -357,3 +357,13 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
 | 2026-08-23 02:16:03 | [async] textures-queued | 0.0 ms | refs 254 |
 | 2026-08-23 02:16:03 | bistro_cafe.pbrt | 5 | 45.1 | 22.2 | ALL | 1 |
 | 2026-08-23 02:16:07 | [async] all-done | 0.0 ms | + 20451.8 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 02:40:00 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 02:40:00 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 02:40:00 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 02:40:01 | bistro_cafe.pbrt | 30 | 61.8 | 16.2 | ALL | 1 |
+| 2026-08-23 02:40:05 | [async] all-done | 0.0 ms | + 588.1 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 02:49:30 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 02:49:30 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 02:49:30 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 02:49:31 | bistro_cafe.pbrt | 10 | 27.4 | 36.5 | ALL | 1 |
+| 2026-08-23 02:49:42 | [async] all-done | 0.0 ms | + 25896.5 ms | import 0.0 ms, total 0.0 ms |
