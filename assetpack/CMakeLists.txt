@@ -97,7 +97,7 @@ if(ASSETPACK_WITH_VIEWER)
                      ${CMAKE_CURRENT_BINARY_DIR}/DirectXTK12)
     target_link_libraries(assetpack_viewer PRIVATE assetpack imgui DirectXTK12
         "${SDL2_ROOT}/lib/x64/SDL2.lib" "${SDL2_ROOT}/lib/x64/SDL2main.lib"
-        d3d12 dxgi d3dcompiler)
+        d3d12 dxgi d3dcompiler windowscodecs shlwapi)
     # PIX GPU capture: WinPixEventRuntime (vendored under third_party/pix,
     # Microsoft license) provides programmatic capture - run the viewer with
     # --pix <file.wpix> to record a GPU timeline for PIX analysis. USE_PIX

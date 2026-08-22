@@ -1263,6 +1263,7 @@ void PbrtParser::appendPacked(const PackMesh& m, const Mat4& M,
 
 void PbrtParser::loadOnePly(const DeferredPly& t, MergedPly& out) {
     out.mat = t.mat;
+    if (auto pf = MappedFile::openShared(t.full)) pf->prefetch(0, pf->size());
     AssetPack ply;
     if (!ply.load(t.full)) {
         addWarning("pbrt: plymesh failed: " + t.full);

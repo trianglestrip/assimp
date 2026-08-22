@@ -6,14 +6,101 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <wincodec.h>
+#include <shlwapi.h>
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb/stb_image.h>
 
 namespace texp {
 
 namespace {
-// deleter for stb's malloc'd decode output (kept out of the header)
+ // deleter for stb's malloc'd decode output (kept out of the header)
 void stbiFree(void* p) { stbi_image_free(p); }
+
+#ifdef _WIN32
+bool tryDecodeWIC(const uint8_t* data, size_t size, int* w, int* h,
+                  unsigned char** out) {
+    thread_local IWICImagingFactory* factory = nullptr;
+    if (!factory) {
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                      CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory));
+        if (FAILED(hr) || !factory) return false;
+    }
+    IStream* stream = SHCreateMemStream(data, UINT(size));
+    if (!stream) {
+        return false;
+    }
+    IWICBitmapDecoder* decoder = nullptr;
+    HRESULT hr = factory->CreateDecoderFromStream(
+        stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+    if (FAILED(hr)) {
+        stream->Release();
+        return false;
+    }
+    IWICBitmapFrameDecode* frame = nullptr;
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr)) {
+        decoder->Release();
+        stream->Release();
+        return false;
+    }
+    IWICFormatConverter* conv = nullptr;
+    hr = factory->CreateFormatConverter(&conv);
+    if (FAILED(hr)) {
+        frame->Release();
+        decoder->Release();
+        stream->Release();
+        return false;
+    }
+    hr = conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                          WICBitmapDitherTypeNone, nullptr, 0.f,
+                          WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        conv->Release();
+        frame->Release();
+        decoder->Release();
+        stream->Release();
+        return false;
+    }
+    UINT width = 0, height = 0;
+    hr = conv->GetSize(&width, &height);
+    if (FAILED(hr)) {
+        conv->Release();
+        frame->Release();
+        decoder->Release();
+        stream->Release();
+        return false;
+    }
+    *w = int(width);
+    *h = int(height);
+    const size_t stride = size_t(width) * 4;
+    const size_t imageSize = stride * size_t(height);
+    unsigned char* buffer = (unsigned char*)malloc(imageSize);
+    if (!buffer) {
+        conv->Release();
+        frame->Release();
+        decoder->Release();
+        stream->Release();
+        return false;
+    }
+    hr = conv->CopyPixels(nullptr, UINT(stride), UINT(imageSize), buffer);
+    conv->Release();
+    frame->Release();
+    decoder->Release();
+    stream->Release();
+    if (FAILED(hr)) {
+        free(buffer);
+        return false;
+    }
+    *out = buffer;
+    return true;
+}
+#endif
 } // namespace
 
 int TexPipeline::slotFor(std::string_view mtlPath) const {
@@ -111,13 +198,28 @@ void TexPipeline::runDecodeLoop() {
     auto decodeOne = [&](const Ref& t, size_t slot) {
         auto mf = ap::MappedFile::openShared(t.resolved);
         if (!mf) return;
+        // hint OS to bring pages in (cheap when cached, helps when cold)
+        mf->prefetch(0, mf->size());
         bytesMapped += mf->size();
         ++filesMapped;
         int w = 0, h = 0, ch = 0;
-        // stb already outputs upload-ready RGBA bytes: keep them
-        unsigned char* rgba = stbi_load_from_memory(
-            reinterpret_cast<const unsigned char*>(mf->bytes().data()),
-            int(mf->size()), &w, &h, &ch, 4);
+        unsigned char* rgba = nullptr;
+#ifdef _WIN32
+        // WIC (Windows Imaging Component) uses hardware-accelerated
+        // codecs and is significantly faster than stb for PNG/JPEG.
+        // Try it first, fall back to stb.
+        if (!tryDecodeWIC(
+                reinterpret_cast<const uint8_t*>(mf->bytes().data()),
+                mf->size(), &w, &h, &rgba)) {
+            rgba = nullptr;
+        }
+#endif
+        if (!rgba) {
+            // stb fallback (also handles cases WIC cannot)
+            rgba = stbi_load_from_memory(
+                reinterpret_cast<const unsigned char*>(mf->bytes().data()),
+                int(mf->size()), &w, &h, &ch, 4);
+        }
         if (!rgba) {
             AP_LOG_WARN("tex", "decode failed: %s", t.key.c_str());
             return;
@@ -142,6 +244,9 @@ void TexPipeline::runDecodeLoop() {
         pool.emplace_back([&, tid]() {
             (void)tid; // strided assignment keeps completion even; here we
                        // claim the next free slot under the lock instead
+#ifdef _WIN32
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
             for (;;) {
                 Ref r;
                 bool isDiff = false, isOther = false;
@@ -185,6 +290,9 @@ void TexPipeline::runDecodeLoop() {
                            finished_.load(std::memory_order_acquire);
                 });
             }
+#ifdef _WIN32
+            CoUninitialize();
+#endif
         });
     }
     for (auto& th : pool) th.join();

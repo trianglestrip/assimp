@@ -203,3 +203,60 @@ itself hits 1319 ms on some runs. Fair back-to-back comparison:
 end (uncontended decode), queue-based TexPipeline retained as the engine so
 incremental enqueue remains available if a throttled overlap is ever wanted.
 All 91 unit tests pass; bistro renders correctly (123/123 textures).
+| 2026-08-23 01:03:36 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:03:36 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:03:36 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:03:36 | [async] all-done | 0.0 ms | + 998.7 ms | import 0.0 ms, total 0.0 ms |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 01:03:36 | bistro_cafe.pbrt | 30 | 54.5 | 18.3 | ALL | 1 |
+| 2026-08-23 01:03:46 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:03:46 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:03:46 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:03:46 | [async] all-done | 0.0 ms | + 1004.6 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:03:50 | bistro_cafe.pbrt | 30 | 8.1 | 122.8 | ALL | 1 |
+| 2026-08-23 01:06:24 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:06:24 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:06:24 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:06:24 | [async] all-done | 0.0 ms | + 12716.3 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:06:25 | bistro_cafe.pbrt | 30 | 46.1 | 21.7 | ALL | 1 |
+| 2026-08-23 01:06:31 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:06:31 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:06:31 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:06:31 | [async] all-done | 0.0 ms | + 662.5 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:06:33 | bistro_cafe.pbrt | 30 | 15.0 | 66.7 | ALL | 1 |
+| 2026-08-23 01:07:12 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:07:12 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:07:12 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:07:12 | [async] all-done | 0.0 ms | + 5753.7 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:07:15 | bistro_cafe.pbrt | 60 | 23.5 | 42.5 | ALL | 1 |
+| 2026-08-23 01:08:01 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:08:01 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:08:01 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:08:01 | [async] all-done | 0.0 ms | + 4516.6 ms | import 0.0 ms, total 0.0 ms |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 01:08:03 | bistro_cafe.pbrt | 60 | 28.2 | 35.5 | ALL | 1 |
+
+## 运行时优化（无离线） -- 2026-08-23 01:08:46
+本次按约束仅做运行时路径（不做离线预烘焙）：
+
+1. TexPipeline WIC 优先解码 (viewer/TexPipeline.cpp:24, TexPipeline.h:47):
+   - Windows 下优先走 WIC (IWICImagingFactory + SHCreateMemStream + FormatConverter -> 32bppRGBA)，
+     硬件加速编解码，失败回退 stb。线程池每 worker CoInitializeEx，
+     工厂 thread_local 复用避免 CoCreateInstance 开销。
+   - 辅以 MappedFile::prefetch(0,size) (AssetPack.h:80) 提示 OS 预取，减少冷启动缺页。
+   - CMake 追加 windowscodecs shlwapi 链接。
+
+2. Ply I/O 预取 (src/formats/pbrt/PbrtParser.cpp:1264):
+   - loadOnePly 内对每个 ply 文件 openShared 后立即 prefetch 全文件，
+     与并行加载重叠，冷启动有效、热缓存时近零开销。
+
+验证：91/91 通过；bistro 端到端仍受本机温控波动影响（单次测量 0.4~5s 波动，
+交替 A/B 均值显示纹理完成 ~2.6s 持平），说明解码与解析同为 CPU 密集型，
+重叠收益有限。下一步运行时可做：顶点 CTM 改 GPU 侧、绘制按材质合并
+(1591->133)、纹理预算自适应。
