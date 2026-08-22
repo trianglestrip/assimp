@@ -103,6 +103,7 @@ double g_importMs = 0, g_totalMs = 0;
 // ---- materials / textures ----
 std::vector<ap::PackMaterial> g_materials;       // materials snapshot (string_views stay valid)
 texp::TexPipeline g_texPipe;                     // parallel mmap + stb_image decode
+std::atomic<size_t> g_texBudget{32};             // adaptive per-frame upload cap
 std::vector<int> g_meshTex;                      // per-mesh texture slot or -1
 std::atomic<bool> g_noTex{false};                // --untex / T: disable textures
 
@@ -1092,8 +1093,9 @@ int main(int argc, char** argv) {
                 // between frames)
                 g_dx->drawScene(cam, items, g_texPipe.data(),
                                 g_texPipe.readyCount(),
-                                32, g_dxShotNext.empty() ? nullptr
-                                                         : g_dxShotNext.c_str());
+                                g_texBudget.load(std::memory_order_relaxed),
+                                g_dxShotNext.empty() ? nullptr
+                                                     : g_dxShotNext.c_str());
                 tDs0 = Clock::now();
                 g_dxShotNext.clear();
                 // ResourceUploadBatch::End copies the sources into its
@@ -1124,6 +1126,18 @@ int main(int argc, char** argv) {
                     g_accWait += wMs;
                     g_accRecord += rMs;
                     ++g_statN;
+                }
+            }
+            // adaptive texture budget: keep GPU frame ~16ms
+            {
+                float af = 0, as = 0, ao = 0;
+                g_dx->gpuTiming(af, as, ao);
+                if (af > 0.1f) {
+                    size_t cur = g_texBudget.load(std::memory_order_relaxed);
+                    if (af < 12.0f && cur < 64)
+                        g_texBudget.store(cur + 2, std::memory_order_relaxed);
+                    else if (af > 16.6f && cur > 4)
+                        g_texBudget.store(cur > 6 ? cur - 2 : 4, std::memory_order_relaxed);
                 }
             }
             // CPU frame time (displayed by the overlay next frame)

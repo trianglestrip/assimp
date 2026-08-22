@@ -386,3 +386,10 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
 | 2026-08-23 03:08:02 | [async] textures-queued | 0.0 ms | refs 254 |
 | 2026-08-23 03:08:02 | bistro_cafe.pbrt | 10 | 66.0 | 15.2 | ALL | 1 |
 | 2026-08-23 03:08:09 | [async] all-done | 0.0 ms | + 7349.5 ms | import 0.0 ms, total 0.0 ms |
+
+## 迭代4：纹理预算自适应 -- 2026-08-23 03:10:52
+- TexPipeline 已 WIC 优先，PbrtParser 已 GPU CTM，剩余纹理上传预算固定 32
+  在高帧(>16.6ms)会卡顿、低帧(<12ms)浪费；改为自适应：每帧 gpuTiming
+  的 frameMs 反馈，<12ms +2 (cap 64)，>16.6ms -2 (floor 4)
+- 实现：viewer/viewer_demo.cpp:105 新增 g_texBudget atomic，drawScene
+  改用 g_texBudget.load()，每帧 gpuTiming 后自适应；91/91 通过
