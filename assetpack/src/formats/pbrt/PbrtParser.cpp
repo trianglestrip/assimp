@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // PbrtParser - minimal PBRT-v4 scene-file parser for assetpack
 //
 // Self-contained: depends only on the assetpack public API
@@ -908,11 +908,18 @@ bool PbrtParser::load(std::string_view path) {
     states_.push_back(ParseState{matIdentity(), 0});
 
     files_.push_back(FileState{mainFile->text(), 0, sourceDir_});
+    const auto tTok = std::chrono::steady_clock::now();
     parseStream();
+    AP_LOG("pbrt", "token pass: %.0f ms (%zu shapes, %zu deferred ply)",
+           double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - tTok)
+                      .count()),
+           meshMeta_.size(), deferredPly_.size());
 
     // deferred plymesh: parallel load into per-task buffers, then merge
     // strictly in submission order so output stays deterministic
     if (!deferredPly_.empty()) {
+        const auto tPly = std::chrono::steady_clock::now();
         unsigned workers = threads_ ? threads_
                                     : std::thread::hardware_concurrency();
         if (!workers) workers = 4;
@@ -932,11 +939,36 @@ bool PbrtParser::load(std::string_view path) {
                 loadOnePly(deferredPly_[i], merged[i]);
             }
         }
+        const auto tLoaded = std::chrono::steady_clock::now();
+        // pre-reserve the global pools: successive per-task inserts would
+        // otherwise reallocate the whole pool every time (O(n^2) copying -
+        // 6.2 s of concat on bistro before this)
+        size_t totPos = posPool_.size(), totNrm = nrmPool_.size();
+        size_t totUv = uvPool_.size(), totIdx = idxPool_.size();
+        for (const MergedPly& m : merged) {
+            totPos += m.pos.size();
+            totNrm += m.nrm.size();
+            totUv += m.uv.size();
+            totIdx += m.idx.size();
+        }
+        const size_t totVerts = totPos / 3;
+        posPool_.reserve(totPos);
+        // attribute pools may gain zero-fill up to full vertex coverage
+        nrmPool_.reserve(std::max(totNrm, totVerts * 3));
+        uvPool_.reserve(std::max(totUv, totVerts * 2));
+        idxPool_.reserve(totIdx);
         std::vector<int32_t> metaStart(deferredPly_.size(), -1);
         for (const MergedPly& m : merged) {
             metaStart[&m - merged.data()] = int32_t(meshMeta_.size());
             concatPly(m);
         }
+        AP_LOG("pbrt", "ply phase: %.0f ms load+transform, %.0f ms concat",
+               double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          tLoaded - tPly)
+                          .count()),
+               double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - tLoaded)
+                          .count()));
         // resolve area lights that were attached to deferred ply tasks
         for (PackLight& L : result_->lights)
             if (L.kind == LightKind::Area && L.meshIndex < -1)
