@@ -24,12 +24,16 @@ if not exist "%VIEWER%" (
     echo [run_bistro] build it first:
     echo   cmake -G "Visual Studio 17 2022" -A x64 -DASSETPACK_WITH_VIEWER=ON -S "%ROOT%" -B "%ROOT%\build"
     echo   cmake --build "%ROOT%\build" --config Release --target assetpack_viewer
+    pause
     exit /b 1
 )
 if not exist "%SCENE%" (
     echo [run_bistro] scene not found: %SCENE%
+    pause
     exit /b 1
 )
 
 "%VIEWER%" "%SCENE%" %*
+echo [run_bistro] viewer exited with code %ERRORLEVEL%
+pause
 endlocal
