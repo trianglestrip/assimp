@@ -24,6 +24,7 @@ add_library(assetpack
     src/obj/Mtl.cpp
     src/GltfParser.cpp
     src/FbxParser.cpp
+    src/PbrtParser.cpp
 )
 target_include_directories(assetpack
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -42,7 +43,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(assetpack PUBLIC Threads::Threads)
 
 # ---- demo: 解析 + benchmark ----
-add_executable(pack_demo examples/pack_demo.cpp)
+add_executable(pack_demo viewer/pack_demo.cpp)
 target_link_libraries(pack_demo PRIVATE assetpack)
 if(MSVC)
     target_compile_options(pack_demo PRIVATE /utf-8)
@@ -77,9 +78,10 @@ if(ASSETPACK_WITH_VIEWER)
     target_link_libraries(imgui PUBLIC d3d12 dxgi d3dcompiler
         "${SDL2_ROOT}/lib/x64/SDL2.lib")
 
-    add_executable(assetpack_viewer examples/viewer_demo.cpp
-                             examples/TexPipeline.cpp
-                             examples/DxRenderer.cpp)
+    add_executable(assetpack_viewer viewer/viewer_demo.cpp
+                             viewer/TexPipeline.cpp
+                             viewer/DxRenderer.cpp
+                             viewer/RendererFactory.cpp)
     target_include_directories(assetpack_viewer PRIVATE
         ${SDL2_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
     # DirectX Tool Kit for DX12: device/sprite/texture-upload plumbing

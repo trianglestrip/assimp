@@ -315,6 +315,34 @@ static void testGltfAndFbxParsers() {
     }
 }
 
+static void testPbrtBistro() {
+    // Real production PBRT scene: 850 binary plymesh + 741 trianglemesh
+    // shapes pulled in through Include. Skips silently when not present.
+    namespace fs = std::filesystem;
+    const char* bistro = "D:/models/pbrt-v4-scenes/bistro/bistro_cafe.pbrt";
+    if (!fs::exists(bistro)) return;
+    ap::AssetPack pack;
+    CHECK(pack.load(bistro));
+    auto& r = pack.result();
+    CHECK(r.positions.size() > 0);
+    // every trianglemesh yields 1 mesh and every plymesh at least 1,
+    // so a fully-successful load produces >= 850 + 741 meshes
+    if (r.meshes.size() < size_t(1591)) {
+        size_t plyWarn = 0;
+        for (const auto& w : pack.warnings())
+            if (w.find("plymesh") != std::string::npos) ++plyWarn;
+        std::fprintf(stderr, "bistro diag: meshes=%zu verts=%zu plyWarnings=%zu\n",
+                     r.meshes.size(), r.positions.size() / 3, plyWarn);
+        size_t shown = 0;
+        for (const auto& w : pack.warnings()) {
+            if (w.find("plymesh") == std::string::npos) continue;
+            std::fprintf(stderr, "  warn: %s\n", w.c_str());
+            if (++shown >= 3) break;
+        }
+    }
+    CHECK(r.meshes.size() >= size_t(1591));
+}
+
 } // namespace
 
 int main() {
@@ -330,6 +358,7 @@ int main() {
     testObjFeatures();
     testObjWarningsAndTextures();
     testGltfAndFbxParsers();
+    testPbrtBistro();
 
     if (g_failures == 0) {
         std::printf("assetpack_tests: all %d checks passed\n", g_checks);

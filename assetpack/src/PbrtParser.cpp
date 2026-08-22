@@ -11,7 +11,7 @@
 //   - Transform / ConcatTransform / Translate / Rotate / Scale / Identity
 //   - Include file.pbrt (recursively resolved relative to current file)
 //   - Shape trianglemesh / mesh (P, indices, N, uv)
-//   - Shape plymesh (minimal inline ASCII PLY read)
+//   - Shape plymesh (via the shared PLY parser: ascii + binary_little_endian)
 //   - Material / MakeNamedMaterial / NamedMaterial (matte/plastic/metal + Kd/Ks)
 //   - Texture ... imagemap string filename + texture Kd name refs
 //   - LightSource / AreaLightSource (accepted, geometry priority)
@@ -272,6 +272,8 @@ private:
                   const std::vector<float>* N, const std::vector<float>* uv,
                   const std::vector<int>& indices);
     bool loadPlyMesh(const std::string& filename);
+    bool loadPlyAsset(const std::string& full);
+    bool mergePlyViaAssetPack(const std::string& full);
 
     void bindMaterialTexture(PackMaterial& mat, const std::string& texname, int type);
     void ensureTexture(std::string_view path, int type);
@@ -718,9 +720,9 @@ void PbrtParser::handleShape(const std::string& kind, const ParamMap& params) {
     }
 }
 
-bool PbrtParser::loadPlyMesh(const std::string& filename) {
-    std::string dir = files_.empty() ? sourceDir_ : files_.back().dir;
-    std::string full = combinePath(dir, filename);
+// legacy fallback: minimal inline ASCII PLY reader. Binary little-endian
+// files take the mergePlyViaAssetPack path first (see below).
+bool PbrtParser::loadPlyAsset(const std::string& full) {
     auto mf = MappedFile::openShared(full);
     if (!mf) { addWarning("pbrt: plymesh cannot open '" + full + "'"); return false; }
     openFiles_.push_back(mf);
@@ -909,6 +911,91 @@ void PbrtParser::loadAsync(std::string_view path) {
     // NOTE: caller must keep this parser alive until onAllDone fires.
     auto p = std::make_shared<std::string>(path);
     std::thread([this, p]() { load(*p); }).detach();
+}
+
+// plymesh via the shared PLY parser (AssetPack -> "ply" -> PlyParser):
+// handles ascii AND binary_little_endian. Each ply mesh is appended under
+// the current CTM so it lands in world space like a trianglemesh shape,
+// with the active pbrt material assigned.
+bool PbrtParser::mergePlyViaAssetPack(const std::string& full) {
+    AssetPack ply;
+    if (!ply.load(full)) {
+        addWarning("pbrt: plymesh PLY parser failed on '" + full + "'");
+        return false;
+    }
+    const PackResult& pr = ply.result();
+    if (pr.meshes.empty()) return false;
+
+    const Mat4 M = ctm();
+    for (const PackMesh& m : pr.meshes) {
+        if (m.positions.empty()) continue;
+        const size_t base = posPool_.size() / 3;
+        const size_t nv = m.positions.size() / 3;
+        float mbmin[3] = {kInf, kInf, kInf};
+        float mbmax[3] = {-kInf, -kInf, -kInf};
+        for (size_t i = 0; i < nv; ++i) {
+            float ox, oy, oz;
+            matTransformPoint(M, m.positions[i * 3], m.positions[i * 3 + 1],
+                              m.positions[i * 3 + 2], ox, oy, oz);
+            posPool_.push_back(ox);
+            posPool_.push_back(oy);
+            posPool_.push_back(oz);
+            for (int k = 0; k < 3; ++k) {
+                const float v = (k == 0) ? ox : (k == 1) ? oy : oz;
+                if (v < mbmin[k]) mbmin[k] = v;
+                if (v > mbmax[k]) mbmax[k] = v;
+            }
+        }
+
+        size_t nbase = nrmPool_.size() / 3, ncount = 0;
+        if (wantNormals_ && !m.normals.empty()) {
+            for (size_t i = 0; i < nv && i * 3 + 2 < m.normals.size(); ++i) {
+                float ox, oy, oz;
+                matTransformNormal(M, m.normals[i * 3], m.normals[i * 3 + 1],
+                                   m.normals[i * 3 + 2], ox, oy, oz);
+                nrmPool_.push_back(ox);
+                nrmPool_.push_back(oy);
+                nrmPool_.push_back(oz);
+            }
+            ncount = nrmPool_.size() / 3 - nbase;
+        }
+
+        size_t ubase = uvPool_.size() / 2, ucount = 0;
+        if (wantTexcoords_ && !m.texcoords.empty()) {
+            uvPool_.insert(uvPool_.end(), m.texcoords.begin(),
+                           m.texcoords.end());
+            ucount = uvPool_.size() / 2 - ubase;
+        }
+
+        size_t idxBase = idxPool_.size();
+        for (uint32_t ix : m.indices)
+            idxPool_.push_back(uint32_t(base + ix));
+
+        MeshMeta mm;
+        mm.name = intern("plymesh " + std::to_string(meshCounter_++));
+        mm.mat = states_.back().mat;
+        mm.posStart = base;
+        mm.posCount = nv;
+        mm.nrmStart = nbase;
+        mm.nrmCount = ncount;
+        mm.uvStart = ubase;
+        mm.uvCount = ucount;
+        mm.idxStart = idxBase;
+        mm.idxCount = idxPool_.size() - idxBase;
+        for (int k = 0; k < 3; ++k) {
+            mm.bmin[k] = mbmin[k];
+            mm.bmax[k] = mbmax[k];
+        }
+        meshMeta_.push_back(mm);
+    }
+    return true;
+}
+
+bool PbrtParser::loadPlyMesh(const std::string& filename) {
+    std::string dir = files_.empty() ? sourceDir_ : files_.back().dir;
+    const std::string full = combinePath(dir, filename);
+    if (mergePlyViaAssetPack(full)) return true;
+    return loadPlyAsset(full);
 }
 
 void registerPbrtParser() {

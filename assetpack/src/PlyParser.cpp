@@ -32,6 +32,20 @@ int scalarSize(std::string_view type) {
     return 0;
 }
 
+// Canonicalize PLY datatype spellings: int8/uint8/int16/uint16/int32/
+// uint32/int64/uint64 are standard aliases of char/uchar/short/ushort/
+// int/uint/double. Some exporters (e.g. bistro's .ply files) use them.
+std::string_view canonPlyType(std::string_view t) {
+    if (t == "int8") return "char";
+    if (t == "uint8") return "uchar";
+    if (t == "int16") return "short";
+    if (t == "uint16") return "ushort";
+    if (t == "int32") return "int";
+    if (t == "uint32") return "uint";
+    if (t == "int64" || t == "uint64") return "double";
+    return t;
+}
+
 // read a little-endian scalar of `type` from `cur`, advance `cur`.
 // x86 is little-endian so a reinterpret_cast is correct for integers;
 // floats/doubles are copied byte-for-byte.
@@ -253,11 +267,11 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
                 VProp p;
                 if (toks.size() >= 5 && toks[1] == "list") {
                     p.isList = true;
-                    p.listCountType = std::string(toks[2]);
-                    p.listIdxType = std::string(toks[3]);
+                    p.listCountType = std::string(canonPlyType(toks[2]));
+                    p.listIdxType = std::string(canonPlyType(toks[3]));
                     p.type = p.listIdxType;
                 } else if (toks.size() >= 3) {
-                    p.type = std::string(toks[1]);
+                    p.type = std::string(canonPlyType(toks[1]));
                     p.role = roleFromName(toks[2]);
                     if (p.role == R_NX || p.role == R_NY || p.role == R_NZ)
                         hasNormals = true;
@@ -269,8 +283,8 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
             } else if (inFace) {
                 if (toks.size() >= 5 && toks[1] == "list") {
                     faceHasList = true;
-                    faceCountType = std::string(toks[2]);
-                    faceIdxType = std::string(toks[3]);
+                    faceCountType = std::string(canonPlyType(toks[2]));
+                    faceIdxType = std::string(canonPlyType(toks[3]));
                 } else if (toks.size() >= 3) {
                     faceHasList = false;
                     faceIdxType = std::string(toks[1]);

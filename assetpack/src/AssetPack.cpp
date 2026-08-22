@@ -10,6 +10,7 @@ void registerStlParser();   // defined in src/StlParser.cpp
 void registerPlyParser();   // defined in src/PlyParser.cpp
 void registerGltfParser();  // defined in src/GltfParser.cpp
 void registerFbxParser();   // defined in src/FbxParser.cpp
+void registerPbrtParser();  // defined in src/PbrtParser.cpp
 
 // ---- ParserRegistry ----
 
@@ -152,6 +153,7 @@ AssetPack::AssetPack(unsigned threads)
     registerPlyParser();
     registerGltfParser();   // glTF 2.0 (.gltf / .glb)
     registerFbxParser();    // binary FBX 7400+
+    registerPbrtParser();   // PBRT-v4 scene (.pbrt)
 }
 
 AssetPack::~AssetPack() = default;
