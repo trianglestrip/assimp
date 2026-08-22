@@ -31,6 +31,9 @@
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
+#include <taskflow/algorithm/for_each.hpp>   // parallel deferred .ply loading
+#include <taskflow/taskflow.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -166,7 +169,7 @@ struct ParseState {
 
 class PbrtParser final : public ModelParser {
 public:
-    explicit PbrtParser(unsigned /*threads*/ = 0) {
+    explicit PbrtParser(unsigned threads = 0) : threads_(threads) {
         result_ = std::make_shared<PackResult>();
     }
 
@@ -214,9 +217,26 @@ private:
     void emitMesh(const std::string& kind, const std::vector<float>& P,
                   const std::vector<float>* N, const std::vector<float>* uv,
                   const std::vector<int>& indices);
-    bool loadPlyMesh(const std::string& filename);
-    bool loadPlyAsset(const std::string& full);
-    bool mergePlyViaAssetPack(const std::string& full);
+    // deferred plymesh pipeline: shapes record file/CTM/material during
+    // parsing; referenced .ply files then load in parallel and merge in
+    // submission order once the token stream ends
+    struct DeferredPly {
+        std::string full;
+        Mat4 ctm;
+        int mat = 0;
+    };
+    struct MergedPly {                 // per-task local geometry
+        int mat = 0;
+        std::vector<float> pos, nrm, uv;
+        std::vector<uint32_t> idx;
+        std::vector<MeshMeta> meta;    // offsets relative to this buffer
+    };
+    void loadOnePly(const DeferredPly& t, MergedPly& out);
+    void appendPacked(const PackMesh& m, const Mat4& M, MergedPly& out) const;
+    void concatPly(const MergedPly& src);
+
+    std::vector<DeferredPly> deferredPly_;
+    unsigned threads_ = 0;
 
     void bindMaterialTexture(PackMaterial& mat, const std::string& texname, int type);
     void ensureTexture(std::string_view path, int type);
@@ -481,11 +501,17 @@ int PbrtParser::makeMaterial(const std::string& type, const ParamMap& params) {
     mat.name = intern(type.empty() ? std::string("material") : type);
     mat.diffuse[0] = mat.diffuse[1] = mat.diffuse[2] = mat.diffuse[3] = 1.f;
 
-    auto it = params.find("Kd");
-    if (it != params.end()) {
+    // legacy PBRT-v3 names (Kd/Ks) plus the pbrt-v4 renames: matte-style
+    // diffuse is "reflectance" (either a texture reference or rgb/color),
+    // and normals arrive as a plain "string normalmap" path
+    ParamMap::const_iterator it;
+    for (const char* key : {"Kd", "reflectance"}) {
+        it = params.find(key);
+        if (it == params.end()) continue;
         if (it->second.type == "texture") {
-            std::string texname = it->second.strings.empty() ? std::string()
-                                                             : it->second.strings[0];
+            std::string texname = it->second.strings.empty()
+                                      ? std::string()
+                                      : it->second.strings[0];
             bindMaterialTexture(mat, texname, TexDiffuse);
         } else if (!it->second.floats.empty()) {
             const auto& f = it->second.floats;
@@ -494,6 +520,13 @@ int PbrtParser::makeMaterial(const std::string& type, const ParamMap& params) {
             mat.diffuse[2] = clamp01(f.size() > 2 ? f[2] : f[0]);
             mat.diffuse[3] = 1.f;
         }
+        break;   // first hit wins; never mix Kd and reflectance
+    }
+    it = params.find("normalmap");
+    if (it != params.end() && !it->second.strings.empty()) {
+        const std::string_view path = intern(it->second.strings[0]);
+        mat.textures.push_back(PackTexRef{TexNormal, 0, path});
+        ensureTexture(path, TexNormal);
     }
     it = params.find("Ks");
     if (it != params.end() && it->second.type != "texture" && !it->second.floats.empty()) {
@@ -681,113 +714,13 @@ void PbrtParser::handleShape(const std::string& kind, const ParamMap& params) {
             addWarning("pbrt: plymesh without string filename ignored");
             return;
         }
-        if (!loadPlyMesh(fit->second.strings[0]))
-            addWarning("pbrt: plymesh external file skipped");
+        std::string dir = files_.empty() ? sourceDir_ : files_.back().dir;
+        DeferredPly t;
+        t.full = combinePath(dir, fit->second.strings[0]);
+        t.ctm = ctm();
+        t.mat = states_.back().mat;
+        deferredPly_.push_back(std::move(t));
     }
-}
-
-// legacy fallback: minimal inline ASCII PLY reader. Binary little-endian
-// files take the mergePlyViaAssetPack path first (see below).
-bool PbrtParser::loadPlyAsset(const std::string& full) {
-    auto mf = MappedFile::openShared(full);
-    if (!mf) { addWarning("pbrt: plymesh cannot open '" + full + "'"); return false; }
-    openFiles_.push_back(mf);
-    std::string_view txt = mf->text();
-
-    size_t eh = txt.find("end_header");
-    if (eh == std::string_view::npos) { addWarning("pbrt: plymesh no end_header"); return false; }
-    std::string_view header = txt.substr(0, eh);
-    if (header.find("format binary") != std::string_view::npos) {
-        addWarning("pbrt: plymesh binary PLY unsupported");
-        return false;
-    }
-
-    long vcount = 0, fcount = 0, vprops = 0;
-    bool hasFace = false;
-    size_t line = 0;
-    while (line < header.size()) {
-        size_t eol = header.find('\n', line);
-        if (eol == std::string_view::npos) eol = header.size();
-        std::string_view l = header.substr(line, eol - line);
-        line = eol + 1;
-        if (l.find("element vertex") != std::string_view::npos) {
-            size_t sp = l.rfind(' ');
-            if (sp != std::string_view::npos)
-                vcount = std::strtol(l.substr(sp + 1).data(), nullptr, 10);
-        } else if (l.find("element face") != std::string_view::npos) {
-            size_t sp = l.rfind(' ');
-            if (sp != std::string_view::npos) {
-                fcount = std::strtol(l.substr(sp + 1).data(), nullptr, 10);
-                hasFace = true;
-            }
-        } else if (l.find("property") != std::string_view::npos) {
-            vprops++;
-        }
-    }
-    if (vcount <= 0 || !hasFace) {
-        addWarning("pbrt: plymesh header lacks vertex/face counts");
-        return false;
-    }
-    if (vprops < 3) vprops = 3;
-
-    size_t dataStart = txt.find('\n', eh) + 1;
-    std::string_view data = (dataStart < txt.size()) ? txt.substr(dataStart)
-                                                     : std::string_view();
-    std::vector<std::string_view> toks;
-    size_t p = 0;
-    while (p < data.size()) {
-        while (p < data.size() && (data[p] == ' ' || data[p] == '\n' || data[p] == '\t' ||
-                                    data[p] == '\r'))
-            p++;
-        if (p >= data.size()) break;
-        size_t q = p;
-        while (q < data.size() && data[q] != ' ' && data[q] != '\n' && data[q] != '\t' &&
-               data[q] != '\r')
-            q++;
-        toks.push_back(data.substr(p, q - p));
-        p = q;
-    }
-
-    size_t ti = 0;
-    std::vector<float> P;
-    P.reserve((size_t)vcount * 3);
-    for (long v = 0; v < vcount && ti + (size_t)vprops <= toks.size(); ++v) {
-        float x = (float)std::strtod(toks[ti + 0].data(), nullptr);
-        float y = (float)std::strtod(toks[ti + 1].data(), nullptr);
-        float z = (float)std::strtod(toks[ti + 2].data(), nullptr);
-        P.push_back(x); P.push_back(y); P.push_back(z);
-        ti += (size_t)vprops;
-    }
-    std::vector<int> indices;
-    for (long f = 0; f < fcount; ++f) {
-        if (ti >= toks.size()) break;
-        long cnt = std::strtol(toks[ti].data(), nullptr, 10);
-        ti++;
-        if ((long)indices.size() + cnt > (long)toks.size()) break;
-        if (cnt == 3) {
-            indices.push_back((int)std::strtol(toks[ti + 0].data(), nullptr, 10));
-            indices.push_back((int)std::strtol(toks[ti + 1].data(), nullptr, 10));
-            indices.push_back((int)std::strtol(toks[ti + 2].data(), nullptr, 10));
-        } else if (cnt == 4) {
-            int a = (int)std::strtol(toks[ti + 0].data(), nullptr, 10);
-            int b = (int)std::strtol(toks[ti + 1].data(), nullptr, 10);
-            int c = (int)std::strtol(toks[ti + 2].data(), nullptr, 10);
-            int d = (int)std::strtol(toks[ti + 3].data(), nullptr, 10);
-            indices.push_back(a); indices.push_back(b); indices.push_back(c);
-            indices.push_back(a); indices.push_back(c); indices.push_back(d);
-        } else {
-            for (long k = 1; k + 1 < cnt; ++k) {
-                indices.push_back((int)std::strtol(toks[ti + 0].data(), nullptr, 10));
-                indices.push_back((int)std::strtol(toks[ti + k].data(), nullptr, 10));
-                indices.push_back((int)std::strtol(toks[ti + k + 1].data(), nullptr, 10));
-            }
-        }
-        ti += (size_t)cnt;
-    }
-
-    if (P.empty()) return false;
-    emitMesh("plymesh", P, nullptr, nullptr, indices);
-    return true;
 }
 
 bool PbrtParser::load(std::string_view path) {
@@ -811,6 +744,7 @@ bool PbrtParser::load(std::string_view path) {
     meshCounter_ = 0;
     nrmEmittedVerts_ = 0;
     uvEmittedVerts_ = 0;
+    deferredPly_.clear();
 
     auto mainFile = MappedFile::openShared(path);
     if (!mainFile) {
@@ -837,6 +771,31 @@ bool PbrtParser::load(std::string_view path) {
 
     files_.push_back(FileState{mainFile->text(), 0, sourceDir_});
     parseStream();
+
+    // deferred plymesh: parallel load into per-task buffers, then merge
+    // strictly in submission order so output stays deterministic
+    if (!deferredPly_.empty()) {
+        unsigned workers = threads_ ? threads_
+                                    : std::thread::hardware_concurrency();
+        if (!workers) workers = 4;
+        std::vector<MergedPly> merged(deferredPly_.size());
+        if (workers > 1 && deferredPly_.size() > 1) {
+            tf::Executor exec(workers > 16 ? 16 : workers);
+            tf::Taskflow flow;
+            flow.for_each_index(0, int(deferredPly_.size()), 1,
+                                [&](int i) {
+                if (isCancelled()) return;
+                loadOnePly(deferredPly_[size_t(i)], merged[size_t(i)]);
+            });
+            exec.run(flow).wait();
+        } else {
+            for (size_t i = 0; i < deferredPly_.size(); ++i) {
+                if (isCancelled()) break;
+                loadOnePly(deferredPly_[i], merged[i]);
+            }
+        }
+        for (const MergedPly& m : merged) concatPly(m);
+    }
 
     if (isCancelled()) {
         lastError_ = "cancelled";
@@ -881,102 +840,132 @@ void PbrtParser::loadAsync(std::string_view path) {
     std::thread([this, p]() { load(*p); }).detach();
 }
 
-// plymesh via the shared PLY parser (AssetPack -> "ply" -> PlyParser):
-// handles ascii AND binary_little_endian. Each ply mesh is appended under
-// the current CTM so it lands in world space like a trianglemesh shape,
-// with the active pbrt material assigned.
-bool PbrtParser::mergePlyViaAssetPack(const std::string& full) {
-    AssetPack ply;
-    if (!ply.load(full)) {
-        addWarning("pbrt: plymesh PLY parser failed on '" + full + "'");
-        return false;
-    }
-    const PackResult& pr = ply.result();
-    if (pr.meshes.empty()) return false;
+// ---- deferred plymesh pipeline -------------------------------------------
+// Shapes were recorded during parsing (handleShape). Their .ply files load
+// through the shared PlyParser (ascii + binary_little_endian) into
+// per-task buffers, then concatenate in scene order deterministically.
 
-    const Mat4 M = ctm();
-    for (const PackMesh& m : pr.meshes) {
-        if (m.positions.empty()) continue;
-        const size_t base = posPool_.size() / 3;
-        const size_t nv = m.positions.size() / 3;
-        float mbmin[3] = {kInf, kInf, kInf};
-        float mbmax[3] = {-kInf, -kInf, -kInf};
-        for (size_t i = 0; i < nv; ++i) {
-            float ox, oy, oz;
-            matTransformPoint(M, m.positions[i * 3], m.positions[i * 3 + 1],
-                              m.positions[i * 3 + 2], ox, oy, oz);
-            posPool_.push_back(ox);
-            posPool_.push_back(oy);
-            posPool_.push_back(oz);
-            for (int k = 0; k < 3; ++k) {
-                const float v = (k == 0) ? ox : (k == 1) ? oy : oz;
-                if (v < mbmin[k]) mbmin[k] = v;
-                if (v > mbmax[k]) mbmax[k] = v;
-            }
-        }
-
-        size_t nbase = nrmPool_.size() / 3, ncount = 0;
-        const bool meshNrm = wantNormals_ && !m.normals.empty();
-        if (meshNrm || !nrmPool_.empty()) {
-            if (nrmEmittedVerts_ < base) nrmPool_.resize(base * 3, 0.f);
-            if (meshNrm) {
-                for (size_t i = 0; i < nv && i * 3 + 2 < m.normals.size(); ++i) {
-                    float ox, oy, oz;
-                    matTransformNormal(M, m.normals[i * 3], m.normals[i * 3 + 1],
-                                       m.normals[i * 3 + 2], ox, oy, oz);
-                    nrmPool_.push_back(ox);
-                    nrmPool_.push_back(oy);
-                    nrmPool_.push_back(oz);
-                }
-            }
-            // pad to nv either way (shape lacks normals or had fewer rows)
-            if (nrmPool_.size() / 3 < base + nv)
-                nrmPool_.resize((base + nv) * 3, 0.f);
-            nrmEmittedVerts_ = base + nv;
-            ncount = nv;
-        }
-
-        size_t ubase = uvPool_.size() / 2, ucount = 0;
-        const bool meshUv = wantTexcoords_ && !m.texcoords.empty();
-        if (meshUv || !uvPool_.empty()) {
-            if (uvEmittedVerts_ < base) uvPool_.resize(base * 2, 0.f);
-            uvPool_.insert(uvPool_.end(), m.texcoords.begin(),
-                           m.texcoords.end());
-            if (uvPool_.size() / 2 < base + nv)
-                uvPool_.resize((base + nv) * 2, 0.f);
-            uvEmittedVerts_ = base + nv;
-            ucount = nv;
-        }
-
-        size_t idxBase = idxPool_.size();
-        for (uint32_t ix : m.indices)
-            idxPool_.push_back(uint32_t(base + ix));
-
-        MeshMeta mm;
-        mm.name = intern("plymesh " + std::to_string(meshCounter_++));
-        mm.mat = states_.back().mat;
-        mm.posStart = base;
-        mm.posCount = nv;
-        mm.nrmStart = nbase;
-        mm.nrmCount = ncount;
-        mm.uvStart = ubase;
-        mm.uvCount = ucount;
-        mm.idxStart = idxBase;
-        mm.idxCount = idxPool_.size() - idxBase;
+// copy one ply sub-mesh under the shape's CTM into a task-local buffer.
+// Attribute pools stay vertex-aligned once started (zeros where absent),
+// matching the emitMesh contract consumers rely on. Thread-safe: reads
+// only immutable state, writes only `out`.
+void PbrtParser::appendPacked(const PackMesh& m, const Mat4& M,
+                              MergedPly& out) const {
+    if (m.positions.empty()) return;
+    const size_t base = out.pos.size() / 3;
+    const size_t nv = m.positions.size() / 3;
+    out.pos.reserve(out.pos.size() + m.positions.size());
+    if (!m.normals.empty())
+        out.nrm.reserve(out.nrm.size() + m.normals.size());
+    if (!m.texcoords.empty())
+        out.uv.reserve(out.uv.size() + m.texcoords.size());
+    out.idx.reserve(out.idx.size() + m.indices.size());
+    float bmin[3] = {kInf, kInf, kInf};
+    float bmax[3] = {-kInf, -kInf, -kInf};
+    for (size_t i = 0; i < nv; ++i) {
+        float ox, oy, oz;
+        matTransformPoint(M, m.positions[i * 3], m.positions[i * 3 + 1],
+                          m.positions[i * 3 + 2], ox, oy, oz);
+        out.pos.push_back(ox);
+        out.pos.push_back(oy);
+        out.pos.push_back(oz);
         for (int k = 0; k < 3; ++k) {
-            mm.bmin[k] = mbmin[k];
-            mm.bmax[k] = mbmax[k];
+            const float v = (k == 0) ? ox : (k == 1) ? oy : oz;
+            if (v < bmin[k]) bmin[k] = v;
+            if (v > bmax[k]) bmax[k] = v;
         }
-        meshMeta_.push_back(mm);
     }
-    return true;
+
+    const bool meshNrm = wantNormals_ && !m.normals.empty();
+    if (meshNrm || !out.nrm.empty()) {
+        if (out.nrm.size() / 3 < base) out.nrm.resize(base * 3, 0.f);
+        if (meshNrm) {
+            for (size_t i = 0; i < nv && i * 3 + 2 < m.normals.size(); ++i) {
+                float ox, oy, oz;
+                matTransformNormal(M, m.normals[i * 3], m.normals[i * 3 + 1],
+                                   m.normals[i * 3 + 2], ox, oy, oz);
+                out.nrm.push_back(ox);
+                out.nrm.push_back(oy);
+                out.nrm.push_back(oz);
+            }
+        }
+        if (out.nrm.size() / 3 < base + nv)
+            out.nrm.resize((base + nv) * 3, 0.f);
+    }
+
+    const bool meshUv = wantTexcoords_ && !m.texcoords.empty();
+    if (meshUv || !out.uv.empty()) {
+        if (out.uv.size() / 2 < base) out.uv.resize(base * 2, 0.f);
+        out.uv.insert(out.uv.end(), m.texcoords.begin(), m.texcoords.end());
+        if (out.uv.size() / 2 < base + nv)
+            out.uv.resize((base + nv) * 2, 0.f);
+    }
+
+    const size_t idxBase = out.idx.size();
+    for (uint32_t ix : m.indices) out.idx.push_back(uint32_t(base + ix));
+
+    MeshMeta mm;
+    mm.mat = out.mat;
+    mm.posStart = base;
+    mm.posCount = nv;
+    // pools are vertex-aligned when active, so per-vertex attributes map
+    // positionally onto this mesh's slice
+    mm.nrmStart = base;
+    mm.nrmCount = (out.nrm.size() / 3 == base + nv) ? nv : 0;
+    mm.uvStart = base;
+    mm.uvCount = (out.uv.size() / 2 == base + nv) ? nv : 0;
+    mm.idxStart = idxBase;
+    mm.idxCount = out.idx.size() - idxBase;
+    for (int k = 0; k < 3; ++k) { mm.bmin[k] = bmin[k]; mm.bmax[k] = bmax[k]; }
+    out.meta.push_back(mm);
 }
 
-bool PbrtParser::loadPlyMesh(const std::string& filename) {
-    std::string dir = files_.empty() ? sourceDir_ : files_.back().dir;
-    const std::string full = combinePath(dir, filename);
-    if (mergePlyViaAssetPack(full)) return true;
-    return loadPlyAsset(full);
+void PbrtParser::loadOnePly(const DeferredPly& t, MergedPly& out) {
+    out.mat = t.mat;
+    AssetPack ply;
+    if (!ply.load(t.full)) {
+        addWarning("pbrt: plymesh failed: " + t.full);
+        return;
+    }
+    const PackResult& pr = ply.result();
+    for (const PackMesh& m : pr.meshes) appendPacked(m, t.ctm, out);
+}
+
+// merge one task's buffer into the global pools, shifting indices and
+// continuing the vertex-aligned attribute coverage across mixed
+// trianglemesh/plymesh emission
+void PbrtParser::concatPly(const MergedPly& src) {
+    if (src.meta.empty()) return;
+    const size_t gv = posPool_.size() / 3;
+
+    if (!src.nrm.empty() || !nrmPool_.empty()) {
+        if (nrmEmittedVerts_ < gv) nrmPool_.resize(gv * 3, 0.f);
+        nrmPool_.insert(nrmPool_.end(), src.nrm.begin(), src.nrm.end());
+        if (nrmPool_.size() / 3 < gv + src.pos.size() / 3)
+            nrmPool_.resize((gv + src.pos.size() / 3) * 3, 0.f);
+        nrmEmittedVerts_ = nrmPool_.size() / 3;
+    }
+    if (!src.uv.empty() || !uvPool_.empty()) {
+        if (uvEmittedVerts_ < gv) uvPool_.resize(gv * 2, 0.f);
+        uvPool_.insert(uvPool_.end(), src.uv.begin(), src.uv.end());
+        if (uvPool_.size() / 2 < gv + src.pos.size() / 3)
+            uvPool_.resize((gv + src.pos.size() / 3) * 2, 0.f);
+        uvEmittedVerts_ = uvPool_.size() / 2;
+    }
+
+    // local buffers start aligned at the global base, so per-mesh
+    // attribute starts carry over unchanged; only positions/indices shift
+    const size_t ib = idxPool_.size();
+    posPool_.insert(posPool_.end(), src.pos.begin(), src.pos.end());
+    idxPool_.reserve(idxPool_.size() + src.idx.size());
+    for (uint32_t ix : src.idx) idxPool_.push_back(ix + uint32_t(gv));
+
+    for (MeshMeta mm : src.meta) {
+        mm.posStart += gv;
+        mm.idxStart += ib;
+        mm.name = intern("plymesh " + std::to_string(meshCounter_++));
+        meshMeta_.push_back(mm);
+    }
 }
 
 void registerPbrtParser() {

@@ -433,15 +433,6 @@ struct DxRenderer::Impl {
         if (queryHeap)
             list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                            UINT(frameNo % kQuerySlots) * 3);
-        if (frames % 30 == 1) {
-            const auto tB4 = std::chrono::steady_clock::now();
-            AP_LOG("dx",
-                   "beginFrame: waitFence %.2f | upload %.2f | gc %.2f | rec %.2f ms",
-                   std::chrono::duration<double, std::milli>(tB1 - tB0).count(),
-                   std::chrono::duration<double, std::milli>(tB2 - tB1).count(),
-                   std::chrono::duration<double, std::milli>(tB3 - tB2).count(),
-                   std::chrono::duration<double, std::milli>(tB4 - tB3).count());
-        }
 
         // everything (scene + overlay sprites) renders into the MSAA
         // target; the back buffer only receives the resolved image
@@ -1351,6 +1342,7 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
             while (texUploaded_ + n < texTotal && n < texBudget) {
             const size_t i = texUploaded_ + n;
             const texp::DecodedTex& t = texs[i];
+            try {
             // full mip chain + UAV access: GenerateMips (compute shader)
             // fills the lower levels after the base upload, so minified
             // fragments sample a fitting mip instead of thrashing the
@@ -1375,6 +1367,14 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
             g.ptr += (i + 1) * dx.srvSize;
             dx.srv(dx.texRes[i].Get(), c);
             dx.texGpu[i] = g;
+            } catch (const std::exception& e) {
+                // one bad texture must not kill the process: log the
+                // reason once and let draws fall back to the white SRV
+                AP_LOG_WARN("dx", "texture %zu upload failed (%ux%u): %s",
+                            i, t.w, t.h, e.what());
+                dx.texRes[i].Reset();
+                dx.texGpu[i] = dx.whiteGpu;
+            }
             ++n;
         }
         }
@@ -1430,12 +1430,6 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
     const auto tEn0 = std::chrono::steady_clock::now();
     dx.recordMs = float(std::chrono::duration<double, std::milli>(tEn0 - tUp0)
                             .count());
-    if (dx.frames % 30 == 1) {
-        AP_LOG("dx", "drawScene: begin %.2f | upload %.2f | record %.2f ms",
-               std::chrono::duration<double, std::milli>(tDr0 - t0).count(),
-               std::chrono::duration<double, std::milli>(tUp0 - tDr0).count(),
-               std::chrono::duration<double, std::milli>(tEn0 - tUp0).count());
-    }
 
     dx.endFrame(f, shotPath);
     ++dx.frames;

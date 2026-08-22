@@ -427,8 +427,8 @@ static void buildUi(double fpsNow) {
         ImGui::Text("import %.1f ms | total %.1f ms", g_importMs, g_totalMs);
     }
     if (g_texPipe.count() > 0)
-        ImGui::Text("%zu textures%s", g_texPipe.count(),
-                    g_noTex.load() ? " (off)" : "");
+        ImGui::Text("%zu/%zu textures%s", g_texPipe.readyCount(),
+                    g_texPipe.count(), g_noTex.load() ? " (off)" : "");
     ImGui::Separator();
     ImGui::TextDisabled(
         "drag orbit | wheel zoom | WASD move | Q/E height | T tex | Esc quit");
@@ -447,7 +447,8 @@ static void bindTextures() {
         g_meshTex.assign(g_meshTex.size(), -1);
         return;
     }
-    if (g_materials.empty() || g_meshTex.empty() || g_texPipe.count() == 0) return;
+    if (g_materials.empty() || g_meshTex.empty() || g_texPipe.readyCount() == 0)
+        return;
     g_meshTex.assign(g_meshTex.size(), -1);
     size_t nMat = 0, nNoDiff = 0, nLookupFail = 0, nNoUV = 0;
     uint64_t trisNoDiff = 0, trisBound = 0;
@@ -478,6 +479,11 @@ static void bindTextures() {
         if (t >= 0) ++bound;
     for (size_t i = 0; i < g_meshes.size(); ++i)
         if (g_meshTex[i] >= 0) trisBound += g_meshes[i].triangleCount();
+    // progressive rebinds run every few frames while decoding; only log
+    // when the bound count actually moved
+    static int lastBoundLog = -1;
+    if (bound == lastBoundLog) return;
+    lastBoundLog = int(bound);
     AP_LOG("viewer", "textures bound: %zu/%zu meshes (mat %zu, no-diff %zu, lookup-fail %zu, bound-noUV %zu); tris: %llu bound / %llu no-diff",
            bound, g_meshTex.size(), nMat, nNoDiff, nLookupFail, nNoUV,
            (unsigned long long)trisBound, (unsigned long long)trisNoDiff);
@@ -633,21 +639,14 @@ static void bindEvents(ap::AssetPack& pack) {
 
     pack.setOnTexturesReady(
         [](ap::PackResult& r, std::span<const ap::PackTexture> texs) {
-            // blocking parallel mmap + stb_image decode of every external
-            // reference (the shared TexPipeline does the thread pool)
+            // background mmap + stb_image decode of every external
+            // reference; slots publish progressively via readyCount()
             g_texPipe.decodeAll(texs);
-            AP_LOG("viewer",
-                   "textures ready: %zu refs, %d mmap'd (%.1f MB), %zu decoded (%llu px)",
-                   texs.size(), g_texPipe.filesMapped,
-                   double(g_texPipe.bytesMapped) / 1048576.0, g_texPipe.count(),
-                   (unsigned long long)g_texPipe.pixels);
-            benchAppend("| " + timestamp() + " | [async] textures-ready | "
+            AP_LOG("viewer", "textures queued: %zu refs (background decode)",
+                   texs.size());
+            benchAppend("| " + timestamp() + " | [async] textures-queued | "
                         + msStr(double(r.texturesMicros) / 1000.0)
-                        + " ms | files " + std::to_string(g_texPipe.filesMapped)
-                        + ", " + msStr(double(g_texPipe.bytesMapped) / 1048576.0)
-                        + " MB, " + std::to_string(g_texPipe.count())
-                        + " decoded |");
-            bindTextures();
+                        + " ms | refs " + std::to_string(texs.size()) + " |");
         });
 
     pack.setOnAllDone([](ap::PackResult& r, bool ok, std::string_view err) {
@@ -818,6 +817,7 @@ int main(int argc, char** argv) {
         std::optional<Clock::time_point> tAll;
         uint64_t framesAll = 0;
         double fpsNow = 0;
+        bool g_texAllBound = false;   // stop rebinding once decode finished
         size_t texReleasedUpTo = 0;   // decoded slots freed after GPU upload
         while (!g_quit.load()) {
             SDL_Event e;
@@ -1014,6 +1014,13 @@ int main(int argc, char** argv) {
                 std::vector<IRenderer::DrawItem> items;
                 items.reserve(g_meshes.size());
                 const bool texOn = !g_noTex.load();
+                // progressive rebind: as background decoding publishes more
+                // slots, refresh mesh->texture bindings (cheap path lookups)
+                if (!g_texAllBound &&
+                    (g_texPipe.done() || g_frameCount % 15 == 0)) {
+                    bindTextures();
+                    if (g_texPipe.done()) g_texAllBound = true;
+                }
                 for (size_t i = 0; i < g_meshes.size(); ++i) {
                     const ap::PackMesh& m = g_meshes[i];
                     if (m.indices.empty()) continue;
@@ -1036,7 +1043,8 @@ int main(int argc, char** argv) {
                 // drawScene consumes g_dxShotNext; the frame after the shot
                 // request is captured (content is identical: static camera
                 // between frames)
-                g_dx->drawScene(cam, items, g_texPipe.data(), g_texPipe.count(),
+                g_dx->drawScene(cam, items, g_texPipe.data(),
+                                g_texPipe.readyCount(),
                                 32, g_dxShotNext.empty() ? nullptr
                                                          : g_dxShotNext.c_str());
                 tDs0 = Clock::now();
@@ -1077,26 +1085,6 @@ int main(int argc, char** argv) {
                 std::chrono::duration<double, std::milli>(tLoop - g_tPrevLoop)
                     .count();
             g_tPrevLoop = tLoop;
-            // periodic telemetry (the overlay shows the same numbers live)
-            if (g_frameCount % 30 == 0) {
-                float gF = 0, gS = 0, gO = 0;
-                g_dx->gpuTiming(gF, gS, gO);
-                const auto tNow = Clock::now();
-                const double evMs =
-                    std::chrono::duration<double, std::milli>(tUi0 - tEv0)
-                        .count();
-                const double uiMs =
-                    std::chrono::duration<double, std::milli>(tIt0 - tUi0)
-                        .count();
-                const double dsMs =
-                    std::chrono::duration<double, std::milli>(tNow - tIt0)
-                        .count();
-                AP_LOG("viewer",
-                       "frame %llu: cpu %.2f ms [events %.2f + ui %.2f + draw %.2f]"
-                       " | gpu %.2f ms (scene %.2f + ovl %.2f)",
-                       (unsigned long long)g_frameCount, g_cpuFrameMs, evMs,
-                       uiMs, dsMs, gF, gS, gO);
-            }
 
             if (g_allDone.load()) {
                 if (!tAll) tAll = Clock::now();

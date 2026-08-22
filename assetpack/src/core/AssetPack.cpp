@@ -109,6 +109,7 @@ const std::vector<std::string>& ModelParser::warnings() const {
     return warnings_;
 }
 void ModelParser::addWarning(std::string msg) {
+    std::lock_guard<std::mutex> lock(warnMx_);
     warnings_.push_back(std::move(msg));
 }
 

@@ -322,6 +322,9 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
         const std::byte* cur = binBase + pos;
         const std::byte* end = bytes.data() + bytes.size();
 
+        result_->positions.reserve(vertexCount * 3);
+        if (hasNormals) result_->normals.reserve(vertexCount * 3);
+
         for (size_t v = 0; v < vertexCount; ++v) {
             if (isCancelled()) { lastError_ = "cancelled"; return false; }
             float px = 0.f, py = 0.f, pz = 0.f;
@@ -363,6 +366,8 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
         }
 
         // ---- read faces (binary) ----
+        result_->posIndices.reserve(result_->posIndices.size() +
+                                    faceCount * 3);
         for (size_t f = 0; f < faceCount; ++f) {
             if (isCancelled()) { lastError_ = "cancelled"; return false; }
             float kf;

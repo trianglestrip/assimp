@@ -3,18 +3,24 @@
 // TexPipeline - parallel texture decode, shared by both render
 // paths (DX12 + software rasterizer).
 //
-// onTexturesReady fires on a parser thread; decodeAll() runs the
-// whole reference list through a thread pool (mmap + stb_image)
-// and blocks until done. Decoded images keep stb's RGBA byte
-// layout: the DX12 path uploads them verbatim (no swizzle round
-// trip), the software rasterizer samples the same bytes.
+// decodeAll() launches a background pool (mmap + stb_image) and
+// returns immediately: the parser's onTexturesReady thread never
+// blocks, so rendering starts while textures are still decoding.
+// Slots become visible monotonically through readyCount(); draws
+// must only consume that prefix. Decoded images keep stb's RGBA
+// byte layout: the DX12 path uploads them verbatim, the software
+// rasterizer samples the same bytes.
 // ============================================================
 
 #include <assetpack/AssetPack.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -33,26 +39,48 @@ struct DecodedTex {
 
 class TexPipeline {
 public:
-    // Decode every external diffuse reference in parallel. Blocking;
-    // call from the parser's onTexturesReady thread.
+    // Start decoding every external reference in parallel on a
+    // background pool; returns immediately. Slots become visible
+    // monotonically through readyCount().
     void decodeAll(std::span<const ap::PackTexture> texs);
 
     // Free the decoded pixels of slots [from, to) after the renderer
     // uploaded them to the GPU; w/h stay valid for the slot count.
     void releaseSlots(size_t from, size_t to);
 
-    size_t count() const { return texs_.size(); }
+    // total allocated slots (>= readyCount()); only the ready prefix is
+    // safe to consume
+    size_t count() const { return total_; }
+    // number of leading slots fully decoded and immutable
+    size_t readyCount() const { return ready_.load(std::memory_order_acquire); }
+    bool done() const { return done_.load(std::memory_order_acquire); }
+
     const DecodedTex* data() const { return texs_.data(); }
     const DecodedTex& at(size_t i) const { return texs_[i]; }
     int slotFor(std::string_view mtlPath) const;   // -1 when absent
 
-    uint64_t bytesMapped = 0;    // sum of mapped texture file sizes
-    int filesMapped = 0;
-    uint64_t pixels = 0;         // decoded pixel count
-    uint64_t bytesReleased = 0;  // pixels handed to the GPU and freed
+    std::atomic<uint64_t> bytesMapped{0};
+    std::atomic<int> filesMapped{0};
+    std::atomic<uint64_t> pixels{0};
+    uint64_t bytesReleased = 0;
+
+    TexPipeline() = default;
+    ~TexPipeline();
+    TexPipeline(const TexPipeline&) = delete;
+    TexPipeline& operator=(const TexPipeline&) = delete;
 
 private:
-    std::vector<DecodedTex> texs_;
+    void runDecode(const std::vector<const ap::PackTexture*>& diffuse,
+                   const std::vector<const ap::PackTexture*>& others);
+
+    std::vector<DecodedTex> texs_;     // fixed after decodeAll starts
+    std::vector<std::string_view> paths_;   // slot -> source ref path
+    size_t total_ = 0;                 // == texs_.size() once started
+    std::unique_ptr<std::atomic<uint8_t>[]> slotDone_;
+    std::atomic<size_t> ready_{0};     // longest decoded prefix
+    std::atomic<bool> done_{false};
+    std::thread worker_;
+    mutable std::mutex pathMx_;
     std::unordered_map<std::string_view, int> byPath_;
 };
 

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -286,6 +287,7 @@ protected:
     std::shared_ptr<PackResult> result_;
     std::string lastError_;
     std::vector<std::string> warnings_;
+    mutable std::mutex warnMx_;   // warnings may be recorded from workers
     std::atomic<bool> cancel_{false};
 
 private:
