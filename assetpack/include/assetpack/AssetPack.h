@@ -118,12 +118,16 @@ struct PackMesh {
     int32_t  materialIndex = -1;     // index into PackResult::materials
     // zero-copy views into the result's global pools; the index array
     // is relative to those pools
-    std::span<const float>   positions;   // 3 floats per vertex
+    std::span<const float>   positions;   // 3 floats per vertex (local space)
     std::span<const float>   normals;     // 3 floats per vertex (empty when absent)
     std::span<const float>   texcoords;   // 2 floats per vertex (empty when absent)
     std::span<const uint32_t> indices;    // 3 per triangle (packed)
-    float boundsMin[3] = {0,0,0};
+    float boundsMin[3] = {0,0,0};    // world space (after CTM)
     float boundsMax[3] = {0,0,0};
+    // per-mesh world transform (row-major 4x4, identity when not used) -
+    // lets the GPU do the CTM instead of per-vertex CPU transforms
+    float world[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    bool hasWorld = false;
 
     uint32_t vertexCount()  const;
     uint32_t triangleCount() const;

@@ -156,8 +156,10 @@ struct MeshMeta {
     size_t nrmStart = 0, nrmCount = 0;
     size_t uvStart = 0, uvCount = 0;
     size_t idxStart = 0, idxCount = 0;
-    float bmin[3] = {0, 0, 0};
+    float bmin[3] = {0, 0, 0}; // world space
     float bmax[3] = {0, 0, 0};
+    float world[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    bool hasWorld = false;
 };
 
 struct ParseState {
@@ -1159,6 +1161,8 @@ bool PbrtParser::load(std::string_view path) {
         pm.indices = std::span<const uint32_t>(result_->posIndices)
                          .subspan(m.idxStart, m.idxCount);
         for (int k = 0; k < 3; ++k) { pm.boundsMin[k] = m.bmin[k]; pm.boundsMax[k] = m.bmax[k]; }
+        for (int i = 0; i < 16; ++i) pm.world[i] = m.world[i];
+        pm.hasWorld = m.hasWorld;
         result_->meshes.push_back(std::move(pm));
     }
 
@@ -1201,19 +1205,34 @@ void PbrtParser::appendPacked(const PackMesh& m, const Mat4& M,
     if (!m.texcoords.empty())
         out.uv.reserve(out.uv.size() + m.texcoords.size());
     out.idx.reserve(out.idx.size() + m.indices.size());
+    // store positions in local space; world CTM will be applied on GPU
+    float lbmin[3] = {kInf, kInf, kInf};
+    float lbmax[3] = {-kInf, -kInf, -kInf};
+    for (size_t i = 0; i < nv; ++i) {
+        float x = m.positions[i * 3], y = m.positions[i * 3 + 1],
+              z = m.positions[i * 3 + 2];
+        out.pos.push_back(x);
+        out.pos.push_back(y);
+        out.pos.push_back(z);
+        for (int k = 0; k < 3; ++k) {
+            float v = (k == 0) ? x : (k == 1) ? y : z;
+            if (v < lbmin[k]) lbmin[k] = v;
+            if (v > lbmax[k]) lbmax[k] = v;
+        }
+    }
+    // world bounds from 8 local corners to avoid per-vertex CPU transform
     float bmin[3] = {kInf, kInf, kInf};
     float bmax[3] = {-kInf, -kInf, -kInf};
-    for (size_t i = 0; i < nv; ++i) {
-        float ox, oy, oz;
-        matTransformPoint(M, m.positions[i * 3], m.positions[i * 3 + 1],
-                          m.positions[i * 3 + 2], ox, oy, oz);
-        out.pos.push_back(ox);
-        out.pos.push_back(oy);
-        out.pos.push_back(oz);
+    for (int c = 0; c < 8; ++c) {
+        float lx = (c & 1) ? lbmax[0] : lbmin[0];
+        float ly = (c & 2) ? lbmax[1] : lbmin[1];
+        float lz = (c & 4) ? lbmax[2] : lbmin[2];
+        float wx, wy, wz;
+        matTransformPoint(M, lx, ly, lz, wx, wy, wz);
+        float vs[3] = {wx, wy, wz};
         for (int k = 0; k < 3; ++k) {
-            const float v = (k == 0) ? ox : (k == 1) ? oy : oz;
-            if (v < bmin[k]) bmin[k] = v;
-            if (v > bmax[k]) bmax[k] = v;
+            if (vs[k] < bmin[k]) bmin[k] = vs[k];
+            if (vs[k] > bmax[k]) bmax[k] = vs[k];
         }
     }
 
@@ -1258,6 +1277,10 @@ void PbrtParser::appendPacked(const PackMesh& m, const Mat4& M,
     mm.idxStart = idxBase;
     mm.idxCount = out.idx.size() - idxBase;
     for (int k = 0; k < 3; ++k) { mm.bmin[k] = bmin[k]; mm.bmax[k] = bmax[k]; }
+    // store world CTM for GPU (row-major)
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) mm.world[r * 4 + c] = M[c][r];
+    mm.hasWorld = !(M == matIdentity());
     out.meta.push_back(mm);
 }
 

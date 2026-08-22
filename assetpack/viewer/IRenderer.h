@@ -26,6 +26,8 @@ public:
         uint32_t startIndex = 0;   // uint32 index offset into the IBO
         uint32_t color = 0xFF8888A8;   // 0xAARRGGBB material diffuse
         int texSlot = -1;              // TexPipeline slot or -1
+        float world[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        bool hasWorld = false;
     };
 
     virtual ~IRenderer() = default;

@@ -1032,6 +1032,8 @@ int main(int argc, char** argv) {
                     it.startIndex = uint32_t(g_meshTriStart[i] * 3);
                     it.color = g_matColor[i];
                     it.texSlot = texOn && g_meshTex[i] >= 0 ? g_meshTex[i] : -1;
+                    for (int k = 0; k < 16; ++k) it.world[k] = m.world[k];
+                    it.hasWorld = m.hasWorld;
                     items.push_back(it);
                 }
                 // group same-texture draws: the renderer binds the texture

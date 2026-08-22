@@ -756,12 +756,11 @@ bool DxRenderer::init(SDL_Window* win, int w, int h, bool warp) {
     }
 
     // root signature: b0 = camera math (16 DWORDs), b1 = material color
-    // (4) + hasTex (1), t0 = texture table, s0 = linear/clamp (sprites),
-    // s1 = nearest/clamp (scene)
+    // (4) + hasTex (1), b2 = per-mesh world CTM (16), t0 = texture table
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 1;
-    D3D12_ROOT_PARAMETER params[3]{};
+    D3D12_ROOT_PARAMETER params[4]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
     params[0].Constants.Num32BitValues = 16;
@@ -770,9 +769,13 @@ bool DxRenderer::init(SDL_Window* win, int w, int h, bool warp) {
     params[1].Constants.ShaderRegister = 1;
     params[1].Constants.Num32BitValues = 5;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable = {1, &range};
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[2].Constants.ShaderRegister = 2;
+    params[2].Constants.Num32BitValues = 16;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable = {1, &range};
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC ss[2]{};
     ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     ss[0].AddressU = ss[0].AddressV = ss[0].AddressW =
@@ -789,7 +792,7 @@ bool DxRenderer::init(SDL_Window* win, int w, int h, bool warp) {
                                            // smeared them into edge streaks
     ss[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC rsd{};
-    rsd.NumParameters = 3;
+    rsd.NumParameters = 4;
     rsd.pParameters = params;
     rsd.NumStaticSamplers = 2;
     rsd.pStaticSamplers = ss;
@@ -814,8 +817,10 @@ bool DxRenderer::init(SDL_Window* win, int w, int h, bool warp) {
 struct VSIn { float3 pos : POSITION; float2 uv : TEXCOORD; };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD; };
 cbuffer Cam : register(b0) { float4 g_s[4]; };
+cbuffer World : register(b2) { row_major float4x4 g_world; };
 VSOut main(VSIn v) {
-    float3 p = (v.pos - g_s[1].yzw) * g_s[1].x;
+    float3 pW = mul(float4(v.pos, 1), g_world).xyz;
+    float3 p = (pW - g_s[1].yzw) * g_s[1].x;
     float x1 = g_s[0].x * p.x + g_s[0].y * p.z;
     float z1 = -g_s[0].y * p.x + g_s[0].x * p.z;
     float vx = x1 + g_s[2].y;
@@ -1414,9 +1419,10 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
             float(hasTex),
         };
         if (it.texSlot != lastSlot) {
-            dx.list->SetGraphicsRootDescriptorTable(2, texGpu);
+            dx.list->SetGraphicsRootDescriptorTable(3, texGpu);
             lastSlot = it.texSlot;
         }
+        dx.list->SetGraphicsRoot32BitConstants(2, 16, it.world, 0);
         dx.list->SetGraphicsRoot32BitConstants(1, 5, mats, 0);
         dx.list->DrawIndexedInstanced(it.indexCount, 1, it.startIndex, 0, 0);
     }
