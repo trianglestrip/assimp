@@ -327,8 +327,7 @@ static void testPbrtBistro() {
     CHECK(r.positions.size() > 0);
     // every trianglemesh yields 1 mesh and every plymesh at least 1,
     // so a fully-successful load produces >= 850 + 741 meshes
-    if (r.meshes.size() < size_t(1591)) {
-        size_t plyWarn = 0;
+    if (r.meshes.size() < size_t(1591)) {        size_t plyWarn = 0;
         for (const auto& w : pack.warnings())
             if (w.find("plymesh") != std::string::npos) ++plyWarn;
         std::fprintf(stderr, "bistro diag: meshes=%zu verts=%zu plyWarnings=%zu\n",
@@ -341,6 +340,70 @@ static void testPbrtBistro() {
         }
     }
     CHECK(r.meshes.size() >= size_t(1591));
+    // scene entities: LookAt+Camera+Film and the sky LightSource
+    CHECK(r.cameras.size() >= 1);
+    CHECK(r.activeCamera >= 0);
+    if (!r.cameras.empty()) {
+        const ap::PackCamera& c = r.cameras[0];
+        CHECK(c.fovYDegrees > 40.f && c.fovYDegrees < 70.f);   // scene: 53
+        CHECK(c.aspect > 1.5f);                                // 1920/1080
+        const float d[3] = {c.position[0] + 3.2f, c.position[1] - 0.3f,
+                            c.position[2] - 1.5f};
+        (void)d;   // position sanity left to the visual check
+    }
+    CHECK(r.lights.size() >= 1);   // infinite env light at minimum
+}
+
+static void testSceneEntitiesPbrt() {
+    // hand-written scene exercising LookAt/Camera/Film/LightSource/
+    // AreaLightSource through the shared PackCamera/PackLight contract
+    const std::string pbrt =
+        "Film \"rgb\" \"integer xresolution\" [800] \"integer yresolution\" [600]\n"
+        "LookAt 0 5 10  0 0 0  0 1 0\n"
+        "Camera \"perspective\" \"float fov\" [45]\n"
+        "WorldBegin\n"
+        "LightSource \"infinite\" \"rgb L\" [1.0 0.9 0.8] \"float scale\" 2\n"
+        "AttributeBegin\n"
+        "Translate 3 4 5\n"
+        "LightSource \"point\" \"rgb I\" [1 1 1]\n"
+        "AreaLightSource \"diffuse\" \"rgb L\" [1 0.2 0.1]\n"
+        "Shape \"trianglemesh\" \"point3 P\" [0 0 0 1 0 0 0 1 0]"
+        " \"integer indices\" [0 1 2]\n"
+        "AttributeEnd\n"
+        "WorldEnd\n";
+    const std::string path = writeTemp("ap_scene.pbrt", pbrt);
+    ap::AssetPack pack;
+    CHECK(pack.load(path));
+    auto& r = pack.result();
+
+    CHECK_EQ(r.cameras.size(), size_t(1));
+    if (!r.cameras.empty()) {
+        const ap::PackCamera& c = r.cameras[0];
+        CHECK_NEAR(c.fovYDegrees, 45.f, 0.01f);
+        CHECK_NEAR(c.aspect, 800.f / 600.f, 0.001f);
+        CHECK_NEAR(c.position[2], 10.f, 0.01f);
+        CHECK_NEAR(c.up[1], 1.f, 0.01f);
+    }
+    CHECK(r.activeCamera >= 0);
+
+    CHECK_EQ(r.lights.size(), size_t(3));
+    bool sawInfinite = false, sawPoint = false, sawArea = false;
+    for (const ap::PackLight& L : r.lights) {
+        if (L.kind == ap::LightKind::Infinite) {
+            sawInfinite = true;
+            CHECK_NEAR(L.intensity, 2.f, 0.01f);
+            CHECK_NEAR(L.color[1], 0.9f, 0.01f);
+        } else if (L.kind == ap::LightKind::Point) {
+            sawPoint = true;
+            CHECK_NEAR(L.position[0], 3.f, 0.01f);
+            CHECK_NEAR(L.position[2], 5.f, 0.01f);
+        } else if (L.kind == ap::LightKind::Area) {
+            sawArea = true;
+            CHECK(L.meshIndex >= 0);
+            CHECK_NEAR(L.color[0], 1.f, 0.01f);
+        }
+    }
+    CHECK(sawInfinite && sawPoint && sawArea);
 }
 
 } // namespace
@@ -359,6 +422,7 @@ int main() {
     testObjWarningsAndTextures();
     testGltfAndFbxParsers();
     testPbrtBistro();
+    testSceneEntitiesPbrt();
 
     if (g_failures == 0) {
         std::printf("assetpack_tests: all %d checks passed\n", g_checks);

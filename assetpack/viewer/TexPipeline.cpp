@@ -41,9 +41,8 @@ TexPipeline::~TexPipeline() {
     if (worker_.joinable()) worker_.join();
 }
 
-void TexPipeline::runDecode(
-    const std::vector<const ap::PackTexture*>& diffuse,
-    const std::vector<const ap::PackTexture*>& others) {
+void TexPipeline::runDecode(const std::vector<Ref>& diffuse,
+                            const std::vector<Ref>& others) {
     const unsigned n = std::max(1u, std::thread::hardware_concurrency());
 
     // publish the longest fully-decoded prefix: consumers only ever see a
@@ -57,7 +56,7 @@ void TexPipeline::runDecode(
                                                std::memory_order_relaxed)) {
                 {
                     std::lock_guard<std::mutex> lock(pathMx_);
-                    byPath_.emplace(paths_[cur], int(cur));
+                    byPath_.emplace(diffuse[cur].key, int(cur));
                 }
                 cur = ready_.load(std::memory_order_acquire);
             } else {
@@ -66,8 +65,8 @@ void TexPipeline::runDecode(
         }
     };
 
-    auto decodeOne = [&](const ap::PackTexture& t, size_t slot) {
-        auto mf = ap::MappedFile::openShared(t.resolvedPath);
+    auto decodeOne = [&](const Ref& t, size_t slot) {
+        auto mf = ap::MappedFile::openShared(t.resolved);
         if (!mf) return;
         bytesMapped += mf->size();
         ++filesMapped;
@@ -77,8 +76,7 @@ void TexPipeline::runDecode(
             reinterpret_cast<const unsigned char*>(mf->bytes().data()),
             int(mf->size()), &w, &h, &ch, 4);
         if (!rgba) {
-            AP_LOG_WARN("tex", "decode failed: %.*s", int(t.path.size()),
-                        t.path.data());
+            AP_LOG_WARN("tex", "decode failed: %s", t.key.c_str());
             return;
         }
         DecodedTex dt;
@@ -96,14 +94,13 @@ void TexPipeline::runDecode(
             // strided assignment keeps global completion roughly even so
             // the visible prefix advances smoothly
             for (size_t j = tid; j < diffuse.size(); j += n) {
-                decodeOne(*diffuse[j], j);
+                decodeOne(diffuse[j], j);
                 slotDone_[j].store(1, std::memory_order_release);
                 advancePrefix();
             }
             // stat-only mmaps for the non-diffuse refs (normals etc.)
             for (size_t k = tid; k < others.size(); k += n) {
-                auto mf =
-                    ap::MappedFile::openShared(others[k]->resolvedPath);
+                auto mf = ap::MappedFile::openShared(others[k].resolved);
                 if (!mf) continue;
                 bytesMapped += mf->size();
                 ++filesMapped;
@@ -116,19 +113,15 @@ void TexPipeline::runDecode(
 
 void TexPipeline::decodeAll(std::span<const ap::PackTexture> texs) {
     if (worker_.joinable()) return;   // a decode is already in flight
-    std::vector<const ap::PackTexture*> diffuse, others;
+    std::vector<Ref> diffuse, others;
     for (const ap::PackTexture& t : texs) {
         if (t.embedded || t.resolvedPath.empty()) continue;
-        (t.type == int(ap::TexType::TexDiffuse) ? diffuse : others)
-            .push_back(&t);
+        auto& dst = t.type == int(ap::TexType::TexDiffuse) ? diffuse : others;
+        dst.push_back({std::string(t.path), t.resolvedPath});
     }
     total_ = diffuse.size();
     texs_.clear();
     texs_.resize(total_);
-    paths_.clear();
-    paths_.reserve(total_);
-    for (const ap::PackTexture* t : diffuse)
-        paths_.push_back(t->path);
     slotDone_.reset(new std::atomic<uint8_t>[total_ ? total_ : 1]);
     for (size_t i = 0; i < total_; ++i)
         slotDone_[i].store(0, std::memory_order_relaxed);

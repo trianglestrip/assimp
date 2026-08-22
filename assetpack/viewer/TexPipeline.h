@@ -70,11 +70,16 @@ public:
     TexPipeline& operator=(const TexPipeline&) = delete;
 
 private:
-    void runDecode(const std::vector<const ap::PackTexture*>& diffuse,
-                   const std::vector<const ap::PackTexture*>& others);
+    // owned copies: the background worker must not touch parser-owned
+    // memory, which can be freed while a decode is still in flight
+    struct Ref {
+        std::string key;      // material path used for slot lookup
+        std::string resolved; // absolute file path to mmap
+    };
+    void runDecode(const std::vector<Ref>& diffuse,
+                   const std::vector<Ref>& others);
 
     std::vector<DecodedTex> texs_;     // fixed after decodeAll starts
-    std::vector<std::string_view> paths_;   // slot -> source ref path
     size_t total_ = 0;                 // == texs_.size() once started
     std::unique_ptr<std::atomic<uint8_t>[]> slotDone_;
     std::atomic<size_t> ready_{0};     // longest decoded prefix

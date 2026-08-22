@@ -14,7 +14,7 @@ namespace ap {
 
 namespace {
 
-enum VRole { R_NONE, R_PX, R_PY, R_PZ, R_NX, R_NY, R_NZ };
+enum VRole { R_NONE, R_PX, R_PY, R_PZ, R_NX, R_NY, R_NZ, R_U, R_V };
 
 struct VProp {
     VRole role = R_NONE;
@@ -101,6 +101,9 @@ VRole roleFromName(std::string_view name) {
     if (name == "nx") return R_NX;
     if (name == "ny") return R_NY;
     if (name == "nz") return R_NZ;
+    // texture coords: u/v plus the common s/t aliases
+    if (name == "u" || name == "s") return R_U;
+    if (name == "v" || name == "t") return R_V;
     return R_NONE;
 }
 
@@ -197,6 +200,7 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
     size_t faceCount = 0;
     std::vector<VProp> vprops;
     bool hasNormals = false;
+    bool hasUv = false;
     std::string faceCountType = "uchar";
     std::string faceIdxType = "int";
     bool faceHasList = true;
@@ -275,6 +279,7 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
                     p.role = roleFromName(toks[2]);
                     if (p.role == R_NX || p.role == R_NY || p.role == R_NZ)
                         hasNormals = true;
+                    if (p.role == R_U || p.role == R_V) hasUv = true;
                 } else {
                     lastError_ = "malformed vertex property line";
                     return false;
@@ -329,6 +334,7 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
             if (isCancelled()) { lastError_ = "cancelled"; return false; }
             float px = 0.f, py = 0.f, pz = 0.f;
             float nx = 0.f, ny = 0.f, nz = 0.f;
+            float ru = 0.f, rv = 0.f;
             for (const VProp& p : vprops) {
                 if (p.isList) {
                     float cnt;
@@ -351,6 +357,8 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
                         case R_NX: nx = val; break;
                         case R_NY: ny = val; break;
                         case R_NZ: nz = val; break;
+                        case R_U: ru = val; break;
+                        case R_V: rv = val; break;
                         default: break;
                     }
                 }
@@ -362,6 +370,10 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
                 result_->normals.push_back(nx);
                 result_->normals.push_back(ny);
                 result_->normals.push_back(nz);
+            }
+            if (hasUv) {
+                result_->texcoords.push_back(ru);
+                result_->texcoords.push_back(rv);
             }
         }
 
@@ -419,6 +431,7 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
                 { lastError_ = "vertex line has too few tokens"; return false; }
             float px = 0.f, py = 0.f, pz = 0.f;
             float nx = 0.f, ny = 0.f, nz = 0.f;
+            float ru = 0.f, rv = 0.f;
             for (size_t pi = 0; pi < vprops.size(); ++pi) {
                 const VProp& p = vprops[pi];
                 if (p.isList) continue; // ASCII list vertex props are skipped
@@ -430,6 +443,8 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
                     case R_NX: nx = val; break;
                     case R_NY: ny = val; break;
                     case R_NZ: nz = val; break;
+                    case R_U: ru = val; break;
+                    case R_V: rv = val; break;
                     default: break;
                 }
             }
@@ -440,6 +455,10 @@ bool PlyParser::parse(const std::shared_ptr<MappedFile>& mf) {
                 result_->normals.push_back(nx);
                 result_->normals.push_back(ny);
                 result_->normals.push_back(nz);
+            }
+            if (hasUv) {
+                result_->texcoords.push_back(ru);
+                result_->texcoords.push_back(rv);
             }
         }
 

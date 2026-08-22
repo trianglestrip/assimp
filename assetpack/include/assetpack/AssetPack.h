@@ -148,6 +148,32 @@ struct PackMaterial {
     std::vector<PackTexRef> textures;       // bound slots (in type order)
 };
 
+// ---- scene-level entities (shared by scene formats: pbrt, glTF) -----
+enum class LightKind : uint8_t {
+    Unknown, Point, Directional, Infinite, Spot, Area,
+};
+
+struct PackLight {
+    LightKind kind = LightKind::Unknown;
+    std::string_view name;            // format-specific type/name string
+    float color[4] = {1, 1, 1, 1};    // linear RGB + intensity in .a unused
+    float intensity = 1.f;
+    float position[3] = {0, 0, 0};    // point/spot (world space)
+    float direction[3] = {0, 0, -1};  // directional/infinite/spot
+    // area lights reference the mesh they emit from
+    int32_t meshIndex = -1;
+};
+
+struct PackCamera {
+    std::string_view name;            // e.g. "perspective"
+    float position[3] = {0, 0, 0};
+    float target[3] = {0, 0, -1};
+    float up[3] = {0, 1, 0};
+    float fovYDegrees = 45.f;
+    float aspect = 16.f / 9.f;
+    float nearZ = 0.05f, farZ = 100.f;
+};
+
 // ---- textures section ----
 struct PackTexture {
     std::string_view path;          // as referenced in the material
@@ -180,6 +206,11 @@ struct PackResult {
     std::vector<PackMesh>      meshes;
     std::vector<PackMaterial>  materials;
     std::vector<PackTexture>   textures;
+
+    // scene entities (populated by scene formats: pbrt, glTF)
+    std::vector<PackCamera> cameras;
+    std::vector<PackLight>  lights;
+    int32_t activeCamera = -1;        // index into cameras; -1 = none
 
     // per-stage wall times (microseconds)
     uint64_t importMicros = 0;      // main-file parse (geometry)
@@ -258,6 +289,12 @@ public:
     // Parsers and their helpers record non-fatal issues via this; surfaced
     // by warnings().
     void addWarning(std::string msg);
+
+    // scene-entity factories shared by scene formats (pbrt, glTF): append
+    // a defaulted entry and return a mutable reference to fill in
+    static PackCamera& addCamera(PackResult& r, std::string_view name);
+    static PackLight& addLight(PackResult& r, LightKind kind,
+                               std::string_view name);
 
     // Free the geometry pools after the consumer has uploaded them to
     // the GPU (or copied the data out). PackMesh views into the pools

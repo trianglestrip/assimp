@@ -163,6 +163,9 @@ struct MeshMeta {
 struct ParseState {
     Mat4 ctm = matIdentity();
     int mat = 0;
+    bool area = false;          // AreaLightSource active for next shapes
+    float areaCol[3] = {1, 1, 1};
+    float areaInt = 1.f;
 };
 
 } // namespace
@@ -214,6 +217,11 @@ private:
     void storeNamedMaterial(const std::string& name, const ParamMap& params);
     void handleShape(const std::string& kind, const ParamMap& params);
     void handleInclude(const std::string& filename);
+    void handleCamera(const std::string& type, const ParamMap& params);
+    void handleLight(const std::string& type, const ParamMap& params,
+                     bool area);
+    static void copyColor_(const ParamMap& params, float out[3], float& inten);
+    void attachAreaLight_(int taskIdx);
     void emitMesh(const std::string& kind, const std::vector<float>& P,
                   const std::vector<float>* N, const std::vector<float>* uv,
                   const std::vector<int>& indices);
@@ -249,6 +257,14 @@ private:
     bool wantNormals_ = true;
     bool wantTexcoords_ = true;
     bool wantTextureBytes_ = false;
+
+    // camera/film state
+    bool hasLookAt_ = false;
+    float lookPos_[3] = {0, 0, 0};
+    float lookTarget_[3] = {0, 0, -1};
+    float lookUp_[3] = {0, 1, 0};
+    int filmW_ = 0, filmH_ = 0;
+    std::string areaTypeName_;   // type of the active AreaLightSource
 
     std::deque<std::string> interned_;
     std::vector<ParseState> states_;
@@ -459,9 +475,35 @@ void PbrtParser::dispatch(const std::string& low, const std::string& /*raw*/) {
         std::string kind = readName();
         ParamMap params = parseParams();
         handleShape(kind, params);
-    } else if (low == "lightsource" || low == "arealightsource") {
-        readName();
-        parseParams();
+    } else if (low == "lookat") {
+        for (int k = 0; k < 3; ++k) lookPos_[k] = readFloat();
+        for (int k = 0; k < 3; ++k) lookTarget_[k] = readFloat();
+        for (int k = 0; k < 3; ++k) lookUp_[k] = readFloat();
+        hasLookAt_ = true;
+    } else if (low == "camera") {
+        std::string type = readName();
+        ParamMap params = parseParams();
+        handleCamera(type, params);
+    } else if (low == "film") {
+        std::string /*type*/ t = readName();
+        ParamMap params = parseParams();
+        auto x = params.find("xresolution");
+        auto y = params.find("yresolution");
+        if (x != params.end() && !x->second.ints.empty())
+            filmW_ = x->second.ints[0];
+        if (y != params.end() && !y->second.ints.empty())
+            filmH_ = y->second.ints[0];
+    } else if (low == "lightsource") {
+        std::string type = readName();
+        ParamMap params = parseParams();
+        handleLight(type, params, false);
+    } else if (low == "arealightsource") {
+        std::string type = readName();
+        ParamMap params = parseParams();
+        ParseState& s = states_.back();
+        s.area = true;
+        copyColor_(params, s.areaCol, s.areaInt);
+        areaTypeName_ = type;
     } else if (low == "objectbegin") {
         readName();
     } else if (low == "objectend") {
@@ -479,6 +521,100 @@ void PbrtParser::dispatch(const std::string& low, const std::string& /*raw*/) {
             parseParams();
         }
     }
+}
+
+// resolve a light color/intensity from the common parameter spellings
+void PbrtParser::copyColor_(const ParamMap& params, float out[3],
+                            float& inten) {
+    for (const char* key : {"L", "I", "color"}) {
+        auto it = params.find(key);
+        if (it == params.end() || it->second.type == "texture" ||
+            it->second.floats.empty())
+            continue;
+        const auto& f = it->second.floats;
+        out[0] = f[0];
+        out[1] = f.size() > 1 ? f[1] : f[0];
+        out[2] = f.size() > 2 ? f[2] : f[0];
+        break;
+    }
+    auto sc = params.find("scale");
+    if (sc == params.end()) sc = params.find("multiplier");
+    if (sc != params.end() && !sc->second.floats.empty())
+        inten = sc->second.floats[0];
+}
+
+void PbrtParser::handleCamera(const std::string& type, const ParamMap& params) {
+    PackCamera& c = addCamera(*result_, intern(type));
+    if (hasLookAt_) {
+        for (int k = 0; k < 3; ++k) {
+            c.position[k] = lookPos_[k];
+            c.target[k] = lookTarget_[k];
+            c.up[k] = lookUp_[k];
+        }
+    }
+    auto fov = params.find("fov");
+    if (fov != params.end() && !fov->second.floats.empty())
+        c.fovYDegrees = fov->second.floats[0];
+    auto zn = params.find("znear");
+    if (zn != params.end() && !zn->second.floats.empty())
+        c.nearZ = zn->second.floats[0];
+    auto zf = params.find("zfar");
+    if (zf != params.end() && !zf->second.floats.empty())
+        c.farZ = zf->second.floats[0];
+    if (filmW_ > 0 && filmH_ > 0)
+        c.aspect = float(filmW_) / float(filmH_);
+    result_->activeCamera = int32_t(result_->cameras.size()) - 1;
+}
+
+LightKind kindFromTypeName(std::string_view t) {
+    if (t == "infinite") return LightKind::Infinite;
+    if (t == "distant") return LightKind::Directional;
+    if (t == "point") return LightKind::Point;
+    if (t == "spot") return LightKind::Spot;
+    return LightKind::Unknown;
+}
+
+void PbrtParser::handleLight(const std::string& type, const ParamMap& params,
+                             bool /*area*/) {
+    PackLight& L =
+        addLight(*result_, kindFromTypeName(type), intern(type));
+    copyColor_(params, L.color, L.intensity);
+    auto pos = params.find("from");
+    if (pos == params.end()) pos = params.find("position");
+    if (pos != params.end() && pos->second.floats.size() >= 3)
+        for (int q = 0; q < 3; ++q) L.position[q] = pos->second.floats[q];
+    // placed lights inherit the current transform (pbrt semantics):
+    // LightSource "point" after "Translate x y z" sits at that point
+    if (L.kind == LightKind::Point || L.kind == LightKind::Spot) {
+        float ox, oy, oz;
+        matTransformPoint(ctm(), L.position[0], L.position[1],
+                          L.position[2], ox, oy, oz);
+        L.position[0] = ox;
+        L.position[1] = oy;
+        L.position[2] = oz;
+    }
+    auto dir = params.find("direction");
+    if (dir == params.end()) dir = params.find("dir");
+    if (dir == params.end()) dir = params.find("to");
+    if (dir != params.end() && dir->second.floats.size() >= 3)
+        for (int q = 0; q < 3; ++q) L.direction[q] = dir->second.floats[q];
+}
+
+// bind the active AreaLightSource (if any) to the geometry just emitted.
+// Inline shapes know their mesh index immediately; deferred ply tasks get
+// an encoded negative index resolved once their metas concatenate.
+void PbrtParser::attachAreaLight_(int taskIdx) {
+    const ParseState& s = states_.back();
+    if (!s.area) return;
+    PackLight& L = addLight(*result_, LightKind::Area,
+                            intern(areaTypeName_));
+    L.color[0] = s.areaCol[0];
+    L.color[1] = s.areaCol[1];
+    L.color[2] = s.areaCol[2];
+    L.intensity = s.areaInt;
+    L.meshIndex = taskIdx < 0
+                      ? (meshMeta_.empty() ? -1 : int32_t(meshMeta_.size()) - 1)
+                      : int32_t(-(2 + taskIdx));
 }
 
 void PbrtParser::handleInclude(const std::string& filename) {
@@ -708,6 +844,7 @@ void PbrtParser::handleShape(const std::string& kind, const ParamMap& params) {
                 addWarning("pbrt: " + kind + " indices not a multiple of 3");
         }
         emitMesh(kind, P, N, uv, indices);
+        attachAreaLight_(-1);
     } else if (kind == "plymesh") {
         auto fit = params.find("filename");
         if (fit == params.end() || fit->second.strings.empty()) {
@@ -720,6 +857,7 @@ void PbrtParser::handleShape(const std::string& kind, const ParamMap& params) {
         t.ctm = ctm();
         t.mat = states_.back().mat;
         deferredPly_.push_back(std::move(t));
+        attachAreaLight_(int(deferredPly_.size()) - 1);
     }
 }
 
@@ -794,7 +932,15 @@ bool PbrtParser::load(std::string_view path) {
                 loadOnePly(deferredPly_[i], merged[i]);
             }
         }
-        for (const MergedPly& m : merged) concatPly(m);
+        std::vector<int32_t> metaStart(deferredPly_.size(), -1);
+        for (const MergedPly& m : merged) {
+            metaStart[&m - merged.data()] = int32_t(meshMeta_.size());
+            concatPly(m);
+        }
+        // resolve area lights that were attached to deferred ply tasks
+        for (PackLight& L : result_->lights)
+            if (L.kind == LightKind::Area && L.meshIndex < -1)
+                L.meshIndex = metaStart[size_t(-2 - L.meshIndex)];
     }
 
     if (isCancelled()) {

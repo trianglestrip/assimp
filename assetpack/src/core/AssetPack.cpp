@@ -113,6 +113,22 @@ void ModelParser::addWarning(std::string msg) {
     warnings_.push_back(std::move(msg));
 }
 
+PackCamera& ModelParser::addCamera(PackResult& r, std::string_view name) {
+    PackCamera c;
+    c.name = name;
+    r.cameras.push_back(std::move(c));
+    return r.cameras.back();
+}
+
+PackLight& ModelParser::addLight(PackResult& r, LightKind kind,
+                                 std::string_view name) {
+    PackLight l;
+    l.kind = kind;
+    l.name = name;
+    r.lights.push_back(std::move(l));
+    return r.lights.back();
+}
+
 void ModelParser::fireVertices(PackResult& r, std::span<const PackMesh> m) const {
     if (onVerts_) onVerts_(r, m);
 }

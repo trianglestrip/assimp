@@ -171,6 +171,7 @@ private:
     bool buildBufferViews(const rapidjson::Value& root);
     bool geometryPass(const rapidjson::Value& root);
     bool materialPass(const rapidjson::Value& root);
+    bool scenePass(const rapidjson::Value& root);
 
     std::string_view strMember(const rapidjson::Value& v, const char* k) const {
         if (v.HasMember(k) && v[k].IsString())
@@ -613,6 +614,130 @@ bool GltfParser::materialPass(const rapidjson::Value& root) {
     return true;
 }
 
+// ---- scene-level entities: cameras[] + KHR_lights_punctual lights -----
+// Name/path views point into doc_ (stable while the parser is alive).
+bool GltfParser::scenePass(const rapidjson::Value& root) {
+    auto num = [](const rapidjson::Value& o, const char* k,
+                  float& out) -> bool {
+        const auto it = o.FindMember(k);
+        if (it == o.MemberEnd() || !it->value.IsNumber()) return false;
+        out = float(it->value.GetDouble());
+        return true;
+    };
+    auto vec3 = [](const rapidjson::Value& o, const char* k,
+                   float out[3]) -> bool {
+        const auto it = o.FindMember(k);
+        if (it == o.MemberEnd() || !it->value.IsArray() ||
+            it->value.Size() < 3)
+            return false;
+        for (int q = 0; q < 3; ++q)
+            if (it->value[q].IsNumber()) out[q] = float(it->value[q].GetDouble());
+        return true;
+    };
+
+    if (auto cams = root.FindMember("cameras");
+        cams != root.MemberEnd() && cams->value.IsArray()) {
+        for (const auto& c : cams->value.GetArray()) {
+            if (!c.IsObject()) continue;
+            std::string_view nm =
+                c.HasMember("name") ? strMember(c, "name")
+                                    : strMember(c, "type");
+            PackCamera& pc = addCamera(*result_, nm.empty()
+                                                    ? std::string_view("camera")
+                                                    : nm);
+            float v = 0;
+            bool ortho = false;
+            if (auto t = c.FindMember("type");
+                t != c.MemberEnd() && t->value.IsString() &&
+                std::strcmp(t->value.GetString(), "orthographic") == 0)
+                ortho = true;
+            if (!ortho) {
+                if (num(c, "yfov", v))
+                    pc.fovYDegrees = v * 57.2957795f;
+                if (num(c, "aspectRatio", v)) pc.aspect = v;
+            }
+            if (num(c, "znear", v)) pc.nearZ = v;
+            if (num(c, "zfar", v) && v > 0.f) pc.farZ = v;
+        }
+        if (!result_->cameras.empty() && result_->activeCamera < 0)
+            result_->activeCamera = 0;
+    }
+
+    // KHR_lights_punctual: lights defined in extensions, placed by nodes
+    const rapidjson::Value* lightsArr = nullptr;
+    size_t lightCount = 0;
+    if (auto ex = root.FindMember("extensions");
+        ex != root.MemberEnd() && ex->value.IsObject()) {
+        if (auto kl = ex->value.FindMember("KHR_lights_punctual");
+            kl != ex->value.MemberEnd() && kl->value.IsObject()) {
+            if (auto la = kl->value.FindMember("lights");
+                la != kl->value.MemberEnd() && la->value.IsArray()) {
+                lightsArr = &la->value;
+                lightCount = la->value.Size();
+            }
+        }
+    }
+    if (lightsArr) {
+        std::vector<int32_t> nodeOf(lightCount, -1);
+        if (auto nd = root.FindMember("nodes");
+            nd != root.MemberEnd() && nd->value.IsArray()) {
+            int32_t ni = 0;
+            for (const auto& n : nd->value.GetArray()) {
+                if (n.IsObject() && n.HasMember("extensions")) {
+                    const auto& ne = n["extensions"];
+                    if (ne.IsObject()) {
+                        if (auto li = ne.FindMember("KHR_lights_punctual");
+                            li != ne.MemberEnd() && li->value.IsObject()) {
+                            if (auto id = li->value.FindMember("light");
+                                id != li->value.MemberEnd() &&
+                                id->value.IsInt() && id->value.GetInt() >= 0 &&
+                                size_t(id->value.GetInt()) < nodeOf.size())
+                                nodeOf[size_t(id->value.GetInt())] = ni;
+                        }
+                    }
+                }
+                ++ni;
+            }
+        }
+
+        int32_t idx = 0;
+        for (const auto& l : lightsArr->GetArray()) {
+            ++idx;
+            if (!l.IsObject()) continue;
+            std::string_view ty = strMember(l, "type");
+            LightKind kind = LightKind::Point;
+            if (ty == "directional") kind = LightKind::Directional;
+            else if (ty == "spot") kind = LightKind::Spot;
+            else if (ty == "infinite" || ty == "ambient") continue;
+            PackLight& L = addLight(*result_, kind,
+                                    strMember(l, "name").empty()
+                                        ? ty
+                                        : strMember(l, "name"));
+            vec3(l, "color", L.color);
+            if (float v = L.intensity; num(l, "intensity", v)) L.intensity = v;
+            const int32_t n = nodeOf[size_t(idx - 1)];
+            if (n >= 0) {
+                // pull placement from the referencing node's translation
+                if (auto nd = root.FindMember("nodes");
+                    nd != root.MemberEnd() && nd->value.IsArray() &&
+                    size_t(n) < nd->value.Size()) {
+                    const auto& node = nd->value[size_t(n)];
+                    float p[3] = {0, 0, 0};
+                    if (vec3(node, "translation", p))
+                        for (int q = 0; q < 3; ++q) L.position[q] = p[q];
+                }
+                if (kind == LightKind::Directional ||
+                    kind == LightKind::Spot) {
+                    L.direction[0] = 0.f;
+                    L.direction[1] = 0.f;
+                    L.direction[2] = -1.f;   // glTF punctual default -Z
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool GltfParser::parseJson(std::string_view json) {
     doc_.Parse<rapidjson::kParseDefaultFlags>(json.data(), json.size());
     if (doc_.HasParseError()) {
@@ -631,7 +756,7 @@ bool GltfParser::parseJson(std::string_view json) {
     if (!buildBufferViews(root)) return false;
     if (!geometryPass(root)) return false;
     if (!materialPass(root)) return false;
-    return true;
+    return scenePass(root);
 }
 
 bool GltfParser::execute(std::string_view path) {
