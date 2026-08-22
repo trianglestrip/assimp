@@ -260,3 +260,51 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
 交替 A/B 均值显示纹理完成 ~2.6s 持平），说明解码与解析同为 CPU 密集型，
 重叠收益有限。下一步运行时可做：顶点 CTM 改 GPU 侧、绘制按材质合并
 (1591->133)、纹理预算自适应。
+| 2026-08-23 01:17:21 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:17:21 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:17:21 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:17:21 | [async] all-done | 0.0 ms | + 1098.9 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:17:22 | bistro_cafe.pbrt | 30 | 51.3 | 19.5 | ALL | 1 |
+| 2026-08-23 01:19:26 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:19:26 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:19:26 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:19:26 | [async] all-done | 0.0 ms | + 13470.2 ms | import 0.0 ms, total 0.0 ms |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 01:19:27 | bistro_cafe.pbrt | 30 | 28.6 | 35.0 | ALL | 1 |
+| 2026-08-23 01:19:32 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:19:32 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:19:32 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:19:32 | [async] all-done | 0.0 ms | + 692.9 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:19:34 | bistro_cafe.pbrt | 30 | 19.6 | 50.9 | ALL | 1 |
+| 2026-08-23 01:19:37 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:19:37 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:19:37 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:19:37 | [async] all-done | 0.0 ms | + 776.7 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:19:39 | bistro_cafe.pbrt | 30 | 13.7 | 72.7 | ALL | 1 |
+| 2026-08-23 01:19:42 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:19:42 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:19:42 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:19:42 | [async] all-done | 0.0 ms | + 724.8 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:19:44 | bistro_cafe.pbrt | 30 | 13.3 | 75.1 | ALL | 1 |
+| 2026-08-23 01:19:49 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:19:49 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:19:49 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:19:49 | [async] all-done | 0.0 ms | + 1058.1 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:20:02 | bistro_cafe.pbrt | 30 | 2.4 | 415.3 | ALL | 1 |
+| 2026-08-23 01:20:21 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:20:21 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:20:21 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:20:21 | [async] all-done | 0.0 ms | + 11177.0 ms | import 0.0 ms, total 0.0 ms |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 01:20:25 | bistro_cafe.pbrt | 30 | 7.8 | 127.7 | ALL | 1 |
+| 2026-08-23 01:33:35 | [async] vertices-ready | 0.0 ms | verts 8496360 tris 2832120 |
+| 2026-08-23 01:33:35 | [async] materials-ready | 0.0 ms | mats 133 |
+| 2026-08-23 01:33:35 | [async] textures-queued | 0.0 ms | refs 254 |
+| 2026-08-23 01:33:35 | [async] all-done | 0.0 ms | + 9740.3 ms | import 0.0 ms, total 0.0 ms |
+| 2026-08-23 01:33:35 | bistro_cafe.pbrt | 30 | 51.1 | 19.6 | ALL | 1 |
