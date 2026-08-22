@@ -10,25 +10,26 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 解析），模型/材质/贴图三段解析完成各自触发带数据的事件。
 
 # ---- library ----
-# 文件结构：include/ 只放对外 API；src/detail 通用工具；src/obj 是
-# OBJ/MTL 解析器内部分层（Scan 文本扫描 / Geometry 几何子流 / Mtl 材质）。
+# 文件结构：include/ 只放对外 API；src/core 库骨架（门面/日志/mmap）；
+# src/detail 通用解析工具；src/formats/<fmt> 每格式一目录（对齐
+# assimp 上游 code/AssetLib/<Format>/ 惯例）。
 add_library(assetpack
-    src/AssetPack.cpp
-    src/ObjParser.cpp
-    src/StlParser.cpp
-    src/PlyParser.cpp
-    src/MappedFile.cpp
-    src/Log.cpp
-    src/obj/Scan.cpp
-    src/obj/Geometry.cpp
-    src/obj/Mtl.cpp
-    src/GltfParser.cpp
-    src/FbxParser.cpp
-    src/PbrtParser.cpp
+    src/core/AssetPack.cpp
+    src/core/Log.cpp
+    src/core/MappedFile.cpp
+    src/formats/obj/ObjParser.cpp
+    src/formats/obj/Scan.cpp
+    src/formats/obj/Geometry.cpp
+    src/formats/obj/Mtl.cpp
+    src/formats/stl/StlParser.cpp
+    src/formats/ply/PlyParser.cpp
+    src/formats/gltf/GltfParser.cpp
+    src/formats/fbx/FbxParser.cpp
+    src/formats/pbrt/PbrtParser.cpp
 )
 target_include_directories(assetpack
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src           # detail/ obj/ 内部头
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src           # core/ detail/ formats/ 内部头
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party   # <taskflow/taskflow.hpp>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rapidjson/include  # glTF JSON
 )

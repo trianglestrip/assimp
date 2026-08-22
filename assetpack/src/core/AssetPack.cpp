@@ -1,5 +1,5 @@
 #include "assetpack/AssetPack.h"
-#include "obj/ObjParser.h"   // registerObjParser
+#include "formats/obj/ObjParser.h"   // registerObjParser
 
 #include <cctype>
 #include <unordered_map>

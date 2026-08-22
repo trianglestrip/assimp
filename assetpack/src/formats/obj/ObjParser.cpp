@@ -1,10 +1,10 @@
-#include "obj/ObjParser.h"
+#include "ObjParser.h"
 #include "assetpack/AssetPack.h"
 
 #include "detail/TextScan.h"
-#include "obj/Geometry.h"
-#include "obj/Mtl.h"
-#include "obj/Scan.h"
+#include "Geometry.h"
+#include "Mtl.h"
+#include "Scan.h"
 
 #include <memory>
 #include <thread>

@@ -19,7 +19,7 @@
 
 #include "assetpack/AssetPack.h"
 #include "detail/FastParse.h"
-#include "obj/Scan.h"
+#include "formats/obj/Scan.h"
 #include "detail/TextScan.h"
 
 namespace {
