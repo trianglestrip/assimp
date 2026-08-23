@@ -297,7 +297,15 @@ void TexPipeline::decodeOne(const Ref& t, size_t slot) {
     int w = 0, h = 0, ch = 0;
     unsigned char* rgba = nullptr;
     std::vector<std::vector<uint8_t>> cachedMips;
-    if (tryLoadCache(t.resolved, &w, &h, &rgba, &cachedMips)) {
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        bool hit = tryLoadCache(t.resolved, &w, &h, &rgba, &cachedMips);
+        auto t1 = std::chrono::steady_clock::now();
+        if (hit) {
+            ddsMicros.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count(), std::memory_order_relaxed);
+            ddsCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (hit) {
         DecodedTex dt; dt.w=w; dt.h=h; dt.rgba={rgba, &stbiFree}; dt.mips=std::move(cachedMips);
         pixels += size_t(w)*size_t(h);
         {
@@ -309,6 +317,7 @@ void TexPipeline::decodeOne(const Ref& t, size_t slot) {
         auto mf2 = ap::MappedFile::openShared(t.resolved);
         if (mf2) { bytesMapped += mf2->size(); ++filesMapped; }
         return;
+        }
     }
     auto mf = ap::MappedFile::openShared(t.resolved);
     if (!mf) return;
@@ -436,10 +445,11 @@ void TexPipeline::finish() {
         }
         for (auto& f : more) f.wait();
     }
-    if (wicCount.load() || stbCount.load()) {
-        AP_LOG("tex", "decode breakdown: WIC %.1f ms (%zu) | stb %.1f ms (%zu)",
+    if (wicCount.load() || stbCount.load() || ddsCount.load()) {
+        AP_LOG("tex", "decode breakdown: WIC %.1f ms (%zu) | stb %.1f ms (%zu) | DDS %.1f ms (%zu)",
                wicMicros.load() / 1000.0, size_t(wicCount.load()),
-               stbMicros.load() / 1000.0, size_t(stbCount.load()));
+               stbMicros.load() / 1000.0, size_t(stbCount.load()),
+               ddsMicros.load() / 1000.0, size_t(ddsCount.load()));
     }
     done_.store(true, std::memory_order_release);
 }

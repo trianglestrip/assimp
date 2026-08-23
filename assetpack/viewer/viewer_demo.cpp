@@ -775,7 +775,9 @@ static void benchCompareLine(double fps) {
 // ============================================================
 
 int main(int argc, char** argv) {
-    ap::Config::instance().loadFromFile();
+    bool _cfgOk = ap::Config::instance().loadFromFile("F:/project/assimp/assetpack/config.json");
+    if (!_cfgOk) _cfgOk = ap::Config::instance().loadFromFile();
+    AP_LOG("cfg", "load %s cacheImage=%d dir=%s", _cfgOk?"ok":"fail", int(ap::Config::instance().cacheImage), ap::Config::instance().cacheDir.c_str());
     std::string model = kDefaultModel;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

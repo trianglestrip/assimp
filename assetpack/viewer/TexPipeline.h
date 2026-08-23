@@ -75,6 +75,8 @@ public:
     std::atomic<uint64_t> stbMicros{0};
     std::atomic<size_t> wicCount{0};
     std::atomic<size_t> stbCount{0};
+    std::atomic<uint64_t> ddsMicros{0};
+    std::atomic<size_t> ddsCount{0};
     uint64_t bytesReleased = 0;
 
     TexPipeline() = default;
