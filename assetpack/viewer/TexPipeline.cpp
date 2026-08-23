@@ -21,6 +21,10 @@
 
 namespace texp {
 
+static bool s_genMips = false;
+void TexPipeline::setGenMips(bool v) { s_genMips = v; }
+bool TexPipeline::genMipsEnabled() { return s_genMips; }
+
 namespace {
 // deleter for stb's malloc'd decode output (kept out of the header)
 void stbiFree(void* p) { stbi_image_free(p); }
@@ -214,7 +218,10 @@ bool tryLoadCache(const std::string& resolved, int* w, int* h, unsigned char** o
     std::string cp = cachePathFor(resolved);
     if (cp.empty()) return false;
     // try DDS first, then legacy raw cache (wi,hi,rgba) for compat
-    if (tryLoadDDS(cp, w, h, out, outMips)) return true;
+    if (tryLoadDDS(cp, w, h, out, outMips)) {
+        if (!TexPipeline::genMipsEnabled() && outMips) outMips->clear();
+        return true;
+    }
     std::ifstream f(cp, std::ios::binary);
     if (!f) return false;
     int32_t wi=0, hi=0; f.read(reinterpret_cast<char*>(&wi),4); f.read(reinterpret_cast<char*>(&hi),4);
@@ -233,6 +240,7 @@ void saveCache(const std::string& resolved, int w, int h, const unsigned char* r
     if (!cfg.cacheImage) return;
     std::string cp = cachePathFor(resolved);
     if (cp.empty()) return;
+    if (!TexPipeline::genMipsEnabled()) { writeDDS(cp, w, h, rgba, {}); return; }
     auto dm = mips.empty() ? generateMipsCPU(rgba, w, h) : mips;
     writeDDS(cp, w, h, rgba, dm);
 }
@@ -355,9 +363,11 @@ void TexPipeline::decodeOne(const Ref& t, size_t slot) {
         return;
     }
     std::vector<std::vector<uint8_t>> mips;
-    if (ap::Config::instance().cacheImage) {
+    if (ap::Config::instance().cacheImage && TexPipeline::genMipsEnabled()) {
         mips = generateMipsCPU(rgba, w, h);
         saveCache(t.resolved, w, h, rgba, mips);
+    } else if (ap::Config::instance().cacheImage) {
+        saveCache(t.resolved, w, h, rgba, {});
     }
     DecodedTex dt;
     dt.w = w;

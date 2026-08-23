@@ -1352,11 +1352,12 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
             // fills the lower levels after the base upload, so minified
             // fragments sample a fitting mip instead of thrashing the
             // texture cache with full-resolution texels
-            const bool hasMips = !t.mips.empty();
+            const bool genMips = texp::TexPipeline::genMipsEnabled();
+            const bool hasMips = genMips && !t.mips.empty();
             UINT mipCount = hasMips ? UINT(1 + t.mips.size()) : 1;
-            if (!hasMips) for (UINT s = std::max(t.w, t.h); s > 1; s >>= 1) ++mipCount;
-            D3D12_RESOURCE_FLAGS flags = hasMips ? D3D12_RESOURCE_FLAG_NONE
-                                                 : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (genMips && !hasMips) for (UINT s = std::max(t.w, t.h); s > 1; s >>= 1) ++mipCount;
+            D3D12_RESOURCE_FLAGS flags = (genMips && hasMips) ? D3D12_RESOURCE_FLAG_NONE
+                : genMips ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
             dx.texRes[i] =
                 dx.makeTex(UINT(t.w), UINT(t.h), DXGI_FORMAT_R8G8B8A8_UNORM,
                            D3D12_RESOURCE_STATE_COPY_DEST, mipCount, flags);
@@ -1376,7 +1377,7 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
                 dx.upload->Upload(dx.texRes[i].Get(), 0, &sd, 1);
             }
             dx.upload->Transition(dx.texRes[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            if (!hasMips) dx.upload->GenerateMips(dx.texRes[i].Get());
+            if (genMips && !hasMips) dx.upload->GenerateMips(dx.texRes[i].Get());
             D3D12_CPU_DESCRIPTOR_HANDLE c = srvBase;
             D3D12_GPU_DESCRIPTOR_HANDLE g = srvGpuBase;
             c.ptr += (i + 1) * SIZE_T(dx.srvSize);

@@ -42,6 +42,8 @@ struct DecodedTex {
 
 class TexPipeline {
 public:
+    static void setGenMips(bool v);
+    static bool genMipsEnabled();
     // Enqueue external texture references for parallel decode on a
     // background pool. May be called repeatedly as the parser discovers
     // references (incremental), so decode overlaps the parse tail;

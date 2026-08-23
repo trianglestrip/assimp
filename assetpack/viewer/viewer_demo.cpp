@@ -107,6 +107,7 @@ texp::TexPipeline g_texPipe;                     // parallel mmap + stb_image de
 std::atomic<size_t> g_texBudget{32};             // adaptive per-frame upload cap
 std::vector<int> g_meshTex;                      // per-mesh texture slot or -1
 std::atomic<bool> g_noTex{false};                // --untex / T: disable textures
+bool g_genMips = false;                          // display-side, default off (faster)
 
 // ---- scene / camera ----
 float g_scale = 1.f;
@@ -446,6 +447,7 @@ static void buildUi(double fpsNow) {
         int b = int(g_texBudget.load(std::memory_order_relaxed));
         if (ImGui::SliderInt("texBudget", &b, 1, 128)) g_texBudget.store(size_t(b), std::memory_order_relaxed);
     }
+    if (ImGui::Checkbox("Generate mips", &g_genMips)) texp::TexPipeline::setGenMips(g_genMips);
     ImGui::Separator();
     ImGui::TextDisabled(
         "drag orbit | wheel zoom | WASD move | Q/E height | T tex | Esc quit");
@@ -807,6 +809,10 @@ int main(int argc, char** argv) {
             g_useSceneCamera = g_useSceneLights = true;
         } else if (a == "--texBudget" && i + 1 < argc) {
             g_texBudget.store(size_t(std::atoi(argv[++i])), std::memory_order_relaxed);
+        } else if (a == "--genMips") {
+            g_genMips = true;
+        } else if (a == "--noMips") {
+            g_genMips = false;
         } else if (a == "--camDist" && i + 1 < argc) {
             g_camDist = float(std::atof(argv[++i]));   // allow < 0.15 (inside)
         } else if (a == "--renderer" && i + 1 < argc) {
@@ -819,6 +825,7 @@ int main(int argc, char** argv) {
         }
     }
     g_modelName = model.substr(model.find_last_of("/\\") + 1);
+    texp::TexPipeline::setGenMips(g_genMips);
 
     // PIX capturer must be in-process before the D3D12 device is created
     // (PIX does not capture devices that already exist)
