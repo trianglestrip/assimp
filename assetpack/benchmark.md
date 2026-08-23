@@ -393,3 +393,82 @@ All 91 unit tests pass; bistro renders correctly (123/123 textures).
   的 frameMs 反馈，<12ms +2 (cap 64)，>16.6ms -2 (floor 4)
 - 实现：viewer/viewer_demo.cpp:105 新增 g_texBudget atomic，drawScene
   改用 g_texBudget.load()，每帧 gpuTiming 后自适应；91/91 通过
+
+
+# 2026-08-23 san-miguel (root benchmark merged)
+
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 15:23:23 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:23:23 | [async] textures-queued | 0.1 ms | refs 323 |
+| 2026-08-23 15:23:24 | [async] vertices-ready | 41.4 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:23:24 | [async] materials-ready | 0.2 ms | mats 287 |
+| 2026-08-23 15:23:24 | [async] all-done | 1075.9 ms | + 1076.9 ms | import 1071.7 ms, total 1075.9 ms |
+| 2026-08-23 15:23:45 | [async] textures-queued | 0.0 ms | refs 323 |
+| 2026-08-23 15:23:45 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:23:46 | [async] vertices-ready | 39.2 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:23:46 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:23:46 | [async] all-done | 848.3 ms | + 849.0 ms | import 844.1 ms, total 848.3 ms |
+| 2026-08-23 15:24:12 | [async] textures-queued | 0.1 ms | refs 323 |
+| 2026-08-23 15:24:12 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:24:13 | [async] vertices-ready | 36.8 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:24:13 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:24:13 | [async] all-done | 884.7 ms | + 885.2 ms | import 882.9 ms, total 884.7 ms |
+| 2026-08-23 15:24:37 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:24:37 | [async] textures-queued | 0.1 ms | refs 323 |
+| 2026-08-23 15:24:38 | [async] vertices-ready | 33.2 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:24:38 | [async] materials-ready | 0.2 ms | mats 287 |
+| 2026-08-23 15:24:38 | [async] all-done | 869.5 ms | + 870.1 ms | import 867.7 ms, total 869.5 ms |
+| 2026-08-23 15:24:58 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:24:58 | [async] textures-queued | 0.0 ms | refs 323 |
+| 2026-08-23 15:24:59 | [async] vertices-ready | 31.6 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:24:59 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:24:59 | [async] all-done | 893.6 ms | + 894.4 ms | import 891.2 ms, total 893.6 ms |
+| 2026-08-23 15:25:20 | [async] textures-queued | 0.1 ms | refs 323 |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 15:25:20 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:25:31 | [async] textures-queued | 0.1 ms | refs 323 |
+| 2026-08-23 15:25:31 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:25:38 | [async] textures-queued | 0.0 ms | refs 323 |
+| 2026-08-23 15:25:38 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:25:39 | [async] vertices-ready | 32.7 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:25:39 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:25:39 | [async] all-done | 1031.0 ms | + 1031.4 ms | import 1029.9 ms, total 1031.0 ms |
+| 2026-08-23 15:25:56 | [async] textures-queued | 0.0 ms | refs 323 |
+| 2026-08-23 15:25:56 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:25:57 | [async] vertices-ready | 31.8 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:25:57 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:25:57 | [async] all-done | 862.4 ms | + 863.1 ms | import 861.1 ms, total 862.4 ms |
+| 2026-08-23 15:26:52 | [async] textures-queued | 0.1 ms | refs 323 |
+| 2026-08-23 15:26:52 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:26:53 | [async] vertices-ready | 32.2 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:26:53 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:26:53 | [async] all-done | 866.1 ms | + 866.9 ms | import 864.0 ms, total 866.1 ms |
+| 2026-08-23 15:34:05 | [async] textures-queued | 0.1 ms | refs 323 |
+| 2026-08-23 15:34:05 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:34:06 | [async] vertices-ready | 35.8 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:34:06 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:34:06 | [async] all-done | 819.2 ms | + 819.8 ms | import 817.1 ms, total 819.2 ms |
+| 2026-08-23 15:34:12 | [async] textures-queued | 0.0 ms | refs 323 |
+| 2026-08-23 15:34:12 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:34:12 | [async] vertices-ready | 38.7 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:34:12 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:34:12 | [async] all-done | 908.3 ms | + 908.7 ms | import 906.9 ms, total 908.3 ms |
+| 2026-08-23 15:34:19 | [async] textures-queued | 0.1 ms | refs 323 |
+
+## render
+| time | model | frames | avg fps | ms/frame | budget | stride |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-08-23 15:34:19 | san-miguel.obj | 0 | 0.0 | 0.0 | ALL | 1 |
+| 2026-08-23 15:34:20 | [async] vertices-ready | 34.4 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:34:20 | [async] materials-ready | 0.1 ms | mats 287 |
+| 2026-08-23 15:34:20 | [async] all-done | 862.2 ms | + 862.6 ms | import 860.2 ms, total 862.2 ms |
+| 2026-08-23 15:34:25 | [async] textures-queued | 0.1 ms | refs 323 |
+| 2026-08-23 15:34:26 | [async] vertices-ready | 32.0 ms | verts 8037667 tris 9980699 |
+| 2026-08-23 15:34:26 | [async] materials-ready | 0.3 ms | mats 287 |
+| 2026-08-23 15:34:26 | [async] all-done | 837.9 ms | + 838.3 ms | import 836.0 ms, total 837.9 ms |
