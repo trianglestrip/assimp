@@ -246,6 +246,7 @@ void TexPipeline::enqueue(std::span<const ap::PackTexture> texs) {
     if (nd.empty()) return;
     // dispatch diffuse decodes as a taskflow on the shared global executor
     // so PbrtParser's ply loads and texture decodes share the same pool
+    AP_LOG("tex", "enqueue %zu..%zu on %zu workers", old, need, ap::globalExecutor().num_workers());
     tf::Taskflow flow;
     flow.for_each_index(int(old), int(need), 1,
                         [&](int idx) { decodeOne(diffuseQ_[size_t(idx)], size_t(idx)); });
