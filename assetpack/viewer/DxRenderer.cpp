@@ -1352,20 +1352,31 @@ void DxRenderer::drawScene(const float cam[16], std::span<const DrawItem> items,
             // fills the lower levels after the base upload, so minified
             // fragments sample a fitting mip instead of thrashing the
             // texture cache with full-resolution texels
-            UINT mips = 1;
-            for (UINT s = std::max(t.w, t.h); s > 1; s >>= 1) ++mips;
+            const bool hasMips = !t.mips.empty();
+            UINT mipCount = hasMips ? UINT(1 + t.mips.size()) : 1;
+            if (!hasMips) for (UINT s = std::max(t.w, t.h); s > 1; s >>= 1) ++mipCount;
+            D3D12_RESOURCE_FLAGS flags = hasMips ? D3D12_RESOURCE_FLAG_NONE
+                                                 : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             dx.texRes[i] =
                 dx.makeTex(UINT(t.w), UINT(t.h), DXGI_FORMAT_R8G8B8A8_UNORM,
-                           D3D12_RESOURCE_STATE_COPY_DEST, mips,
-                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-            const D3D12_SUBRESOURCE_DATA sd{
-                t.rgba.get(), LONG_PTR(size_t(t.w)) * 4,
-                LONG_PTR(size_t(t.w)) * size_t(t.h) * 4};
-            dx.upload->Upload(dx.texRes[i].Get(), 0, &sd, 1);
-            dx.upload->Transition(dx.texRes[i].Get(),
-                                  D3D12_RESOURCE_STATE_COPY_DEST,
-                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            dx.upload->GenerateMips(dx.texRes[i].Get());
+                           D3D12_RESOURCE_STATE_COPY_DEST, mipCount, flags);
+            if (hasMips) {
+                std::vector<D3D12_SUBRESOURCE_DATA> subs;
+                subs.reserve(mipCount);
+                subs.push_back({t.rgba.get(), LONG_PTR(size_t(t.w))*4, LONG_PTR(size_t(t.w)*size_t(t.h)*4)});
+                int cw=t.w, ch=t.h;
+                for (size_t k=0;k<t.mips.size();++k) {
+                    int nw=std::max(1,cw/2), nh=std::max(1,ch/2);
+                    subs.push_back({t.mips[k].data(), LONG_PTR(size_t(nw))*4, LONG_PTR(t.mips[k].size())});
+                    cw=nw; ch=nh;
+                }
+                dx.upload->Upload(dx.texRes[i].Get(), 0, subs.data(), UINT(subs.size()));
+            } else {
+                const D3D12_SUBRESOURCE_DATA sd{t.rgba.get(), LONG_PTR(size_t(t.w))*4, LONG_PTR(size_t(t.w)*size_t(t.h)*4)};
+                dx.upload->Upload(dx.texRes[i].Get(), 0, &sd, 1);
+            }
+            dx.upload->Transition(dx.texRes[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (!hasMips) dx.upload->GenerateMips(dx.texRes[i].Get());
             D3D12_CPU_DESCRIPTOR_HANDLE c = srvBase;
             D3D12_GPU_DESCRIPTOR_HANDLE g = srvGpuBase;
             c.ptr += (i + 1) * SIZE_T(dx.srvSize);

@@ -35,6 +35,9 @@ struct DecodedTex {
     // RGBA bytes, row 0 = image top. Holds stb's buffer directly (no
     // copy); released by releaseSlots() once the GPU owns its copy.
     TexBytes rgba{nullptr, [](void*) {}};
+    // mip chain beyond base (mip 1..N-1) when cacheImage DDS was loaded
+    // or generated on save; empty means renderer must GenerateMips.
+    std::vector<std::vector<uint8_t>> mips;
 };
 
 class TexPipeline {

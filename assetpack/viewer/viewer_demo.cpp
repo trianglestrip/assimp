@@ -20,6 +20,7 @@
 // WASD: move along the view axis / strafe | Q/E: camera height
 
 #include <assetpack/AssetPack.h>
+#include <assetpack/Config.h>
 
 #include <SDL2/SDL.h>
 
@@ -441,6 +442,10 @@ static void buildUi(double fpsNow) {
         ImGui::Text("%zu cameras%s", g_cameras.size(), g_useSceneCamera ? " (active)" : "");
     if (!g_lights.empty())
         ImGui::Text("%zu lights%s", g_lights.size(), g_useSceneLights ? " (using file)" : " (default)");
+    { // texBudget is display-side config (was formerly Config::texBudget)
+        int b = int(g_texBudget.load(std::memory_order_relaxed));
+        if (ImGui::SliderInt("texBudget", &b, 1, 128)) g_texBudget.store(size_t(b), std::memory_order_relaxed);
+    }
     ImGui::Separator();
     ImGui::TextDisabled(
         "drag orbit | wheel zoom | WASD move | Q/E height | T tex | Esc quit");
@@ -770,6 +775,7 @@ static void benchCompareLine(double fps) {
 // ============================================================
 
 int main(int argc, char** argv) {
+    ap::Config::instance().loadFromFile();
     std::string model = kDefaultModel;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -797,6 +803,8 @@ int main(int argc, char** argv) {
             g_useSceneLights = true;
         } else if (a == "--useScene") {
             g_useSceneCamera = g_useSceneLights = true;
+        } else if (a == "--texBudget" && i + 1 < argc) {
+            g_texBudget.store(size_t(std::atoi(argv[++i])), std::memory_order_relaxed);
         } else if (a == "--camDist" && i + 1 < argc) {
             g_camDist = float(std::atof(argv[++i]));   // allow < 0.15 (inside)
         } else if (a == "--renderer" && i + 1 < argc) {

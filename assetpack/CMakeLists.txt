@@ -15,6 +15,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # assimp 上游 code/AssetLib/<Format>/ 惯例）。
 add_library(assetpack
     src/core/AssetPack.cpp
+    src/core/Config.cpp
     src/core/Log.cpp
     src/core/MappedFile.cpp
     src/formats/obj/ObjParser.cpp
